@@ -47,3 +47,11 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+
+# custom .gitignore for data_extraction
+
+# any text file from data folder
+
+data/*.txt
+data/**/*.txt
