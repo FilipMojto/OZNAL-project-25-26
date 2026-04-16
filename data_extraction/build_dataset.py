@@ -1,7 +1,18 @@
+import os
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
+from dotenv import load_dotenv
 
-DATASETS_DIR = "data/Datasets/"
+from config import DATASETS_DIR, INTERIM_DIR
+# DATASETS_DIR = "data/Datasets/"
+
+# load environment variable from .env file
+
+OUTPUT_FILE = INTERIM_DIR + "dataset.csv"
+
+Path(INTERIM_DIR).mkdir(parents=True, exist_ok=True)
 
 stop_times = pd.read_csv(DATASETS_DIR + "stop_times.txt", low_memory=False)
 print(f"Stop times: {len(stop_times)} rows")
@@ -48,6 +59,10 @@ dataset["departure_seconds"] = dataset["departure_time"].apply(time_to_seconds)
 
 next_arrival = dataset.groupby("trip_id")["arrival_seconds"].shift(-1)
 dataset["segment_time_s"] = next_arrival - dataset["departure_seconds"]
+
+# lets print rows where segment_time_s == 0 or negative, which could indicate data issues or very short segments
+print("Rows with non-positive segment times:")
+print(dataset[dataset["segment_time_s"] <= 0][["trip_id", "stop_id", "arrival_time", "departure_time", "segment_time_s"]])
 
 # --- Segment distance (meters) via shape_dist_traveled from shapes.txt ---
 def haversine(lat1, lon1, lat2, lon2):
@@ -104,9 +119,36 @@ dataset["arrival_time_second"] = arrival_parts[2]
 dataset["seconds_since_midnight"] = dataset["arrival_seconds"] % 86400
 
 # --- Day-type flags ---
-dataset["is_weekday"]  = (dataset[["monday", "tuesday", "wednesday", "thursday", "friday"]].max(axis=1)).astype(int)
-dataset["is_saturday"] = dataset["saturday"].astype(int)
-dataset["is_sunday"]   = dataset["sunday"].astype(int)
+# dataset["is_weekday"]  = (dataset[["monday", "tuesday", "wednesday", "thursday", "friday"]].max(axis=1)).astype(int)
+# dataset["is_saturday"] = dataset["saturday"].astype(int)
+# dataset["is_sunday"]   = dataset["sunday"].astype(int)
+# updated to single categorical column instead of 3 binary flags
+dataset["day_type"] = np.select(
+    [
+        # runs all week
+        (dataset["monday"] == 1) &
+        (dataset["tuesday"] == 1) &
+        (dataset["wednesday"] == 1) &
+        (dataset["thursday"] == 1) &
+        (dataset["friday"] == 1) &
+        (dataset["saturday"] == 1) &
+        (dataset["sunday"] == 1),
+
+        # saturday only
+        (dataset["saturday"] == 1) &
+        (dataset[["monday","tuesday","wednesday","thursday","friday","sunday"]].sum(axis=1) == 0),
+
+        # sunday only
+        (dataset["sunday"] == 1) &
+        (dataset[["monday","tuesday","wednesday","thursday","friday","saturday"]].sum(axis=1) == 0),
+    ],
+    [
+        "all_week",
+        "saturday",
+        "sunday"
+    ],
+    default="weekday"
+)
 
 # --- Time since last stop (seconds between prev departure and current arrival) ---
 prev_departure = dataset.groupby("trip_id")["departure_seconds"].shift(1)
@@ -116,5 +158,5 @@ print(f"Segment time nulls:     {dataset['segment_time_s'].isna().sum()} (last s
 print(f"Segment distance nulls: {dataset['segment_distance_m'].isna().sum()} (last stops in each trip)")
 print(f"Time since last nulls:  {dataset['time_since_last_stop'].isna().sum()} (first stops in each trip)")
 
-dataset.to_csv("dataset.csv", index=False)
-print("Saved to dataset.csv")
+dataset.to_csv(OUTPUT_FILE, index=False)
+print(f"Saved to {OUTPUT_FILE}")

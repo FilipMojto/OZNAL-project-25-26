@@ -59,3 +59,5 @@ data/**/*.txt
 *.csv
 
 data/data_bratislava_mhd_timetable_gtfs/Datasets/*.txt
+
+.env
