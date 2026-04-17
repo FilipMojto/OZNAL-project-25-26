@@ -158,5 +158,9 @@ print(f"Segment time nulls:     {dataset['segment_time_s'].isna().sum()} (last s
 print(f"Segment distance nulls: {dataset['segment_distance_m'].isna().sum()} (last stops in each trip)")
 print(f"Time since last nulls:  {dataset['time_since_last_stop'].isna().sum()} (first stops in each trip)")
 
+# --- data cleaning steps ---
+# dropping the last stops
+dataset = dataset[dataset["segment_time_s"].notna()]
+
 dataset.to_csv(OUTPUT_FILE, index=False)
 print(f"Saved to {OUTPUT_FILE}")
