@@ -182,7 +182,6 @@ print(high_cardinality$column)
 
 # 11. Encoding characters
 timetable <- timetable %>%
-  mutate(across(where(is.character), as.factor))
 
 timetable_encoded <- model.matrix(~ . - 1, data = timetable) %>%
   as.data.frame()
