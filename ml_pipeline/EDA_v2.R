@@ -2,18 +2,21 @@
 library("tidyverse")
 library("readr")
 library("ggplot2")
+library("patchwork")
+library("dplyr")
+library("purrr")
 
 # =========================
 # Load data
 # =========================
 timetable <- read_csv("../data/interim/dataset.csv")
-table(timetable$day_type)
+# table(timetable$day_type)
 
 # =========================
 # Restrict dataset for testing purposes
 # =========================
 
-timetable <- timetable %>% head(n=10000)
+# timetable <- timetable %>% head(n=10000)
 
 # =========================
 # Basic info
@@ -139,30 +142,31 @@ high_cardinality
 
 high_cardinality_cols <- high_cardinality %>% pull(column)
 high_cardinality_cols
+
 # =========================
 # 6. Correlation (numeric only)
 # =========================
 
 # here we drop the feature from a highly correlated pair that has
 # smaller correlation with target
-target_cor <- timetable %>%
-  select(where(is.numeric)) %>%
-  cor(use = "complete.obs")
-
-target_cor_vec <- abs(target_cor[, "segment_time_s"])
-
-cor_pairs <- cor_pairs %>%
-  mutate(
-    cor_var1_target = target_cor_vec[Var1],
-    cor_var2_target = target_cor_vec[Var2],
-    drop = if_else(cor_var1_target >= cor_var2_target, Var2, Var1)
-  )
-
-highly_correlated <- cor_pairs %>%
-  pull(drop) %>%
-  unique()
-
-print(highly_correlated)
+# target_cor <- timetable %>%
+#   select(where(is.numeric)) %>%
+#   cor(use = "complete.obs")
+# 
+# target_cor_vec <- abs(target_cor[, "segment_time_s"])
+# 
+# cor_pairs <- cor_pairs %>%
+#   mutate(
+#     cor_var1_target = target_cor_vec[Var1],
+#     cor_var2_target = target_cor_vec[Var2],
+#     drop = if_else(cor_var1_target >= cor_var2_target, Var2, Var1)
+#   )
+# 
+# highly_correlated <- cor_pairs %>%
+#   pull(drop) %>%
+#   unique()
+# 
+# print(highly_correlated)
 
 # =========================
 # 7. Dropping useless Rows & Cols
@@ -248,11 +252,13 @@ timetable_reduced <- drop_rows_report(timetable_reduced, dup_row_indexes)
 
 timetable_reduced <- drop_cols_report(timetable_reduced, dup_cols)
 
-# ===
-# 7.7 Highly-correlated cols
-# ===
+# # ===
+# # 7.7 Highly-correlated cols
+# # ===
+# 
+# timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated)
 
-timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated)
+# glimpse(timetable_reduced)
 
 # ===
 # 7.8 Highly correlated char cols
@@ -262,7 +268,7 @@ timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated)
 
 highly_correlated_char = c('arrival_time', 'service_id', 'shape_id', 'stop_id',
                            'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
-                           'saturday', 'sunday')
+                           'saturday', 'sunday', 'trip_id', 'stop_sequence')
 timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated_char)
 
 # ===
@@ -279,6 +285,8 @@ timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated_char)
 # ===
 dim(timetable_reduced)
 glimpse(timetable_reduced)
+
+
 
 # =========================
 # 8. Handling missing values
@@ -323,10 +331,103 @@ dim(timetable_imputed)
 glimpse(timetable_imputed)
 
 
+# Scan all character columns and count unique values
+unique_counts <- timetable_imputed %>%
+  summarise(across(where(is.character), ~n_distinct(.))) %>%
+  pivot_longer(cols = everything(), names_to = "column_name", values_to = "unique_count")
+
+print(unique_counts)
+
 
 # =========================
 # 9. Handling categorical values
 # =========================
+
+# =========================================================
+# 1. One-hot encoding for low-cardinality predictors
+#    Returns the original dataset with encoded columns added
+#    and the original column removed.
+# =========================================================
+one_hot_encode <- function(data, col) {
+  data[[col]] <- as.factor(data[[col]])
+  
+  mm <- model.matrix(
+    as.formula(paste0("~ `", col, "` - 1")),
+    data = data
+  ) %>%
+    as.data.frame()
+  
+  data %>%
+    bind_cols(mm) %>%
+    select(-all_of(col))
+}
+
+# =========================================================
+# 2. Frequency encoding
+#    Replaces each category by its relative frequency.
+#    Good for medium/high-cardinality categoricals.
+# =========================================================
+frequency_encode <- function(data, col, new_col = NULL) {
+  if (is.null(new_col)) {
+    new_col <- paste0(col, "_freq")
+  }
+  
+  freq_tbl <- data %>%
+    count(.data[[col]], name = "n") %>%
+    mutate(freq = n / sum(n)) %>%
+    select(all_of(col), freq)
+  
+  data %>%
+    left_join(freq_tbl, by = col) %>%
+    rename(!!new_col := freq)
+}
+
+# =========================================================
+# 7. Hex color -> RGB
+#    Good for route_color if you want numeric representation
+#    without category explosion.
+# =========================================================
+hex_to_rgb_df <- function(data, col = "route_color", prefix = "route") {
+  hex_to_rgb <- function(hex) {
+    hex <- gsub("#", "", as.character(hex))
+    if (is.na(hex) || nchar(hex) != 6) return(c(NA, NA, NA))
+    c(
+      strtoi(substr(hex, 1, 2), 16L),
+      strtoi(substr(hex, 3, 4), 16L),
+      strtoi(substr(hex, 5, 6), 16L)
+    )
+  }
+  
+  rgb_vals <- t(sapply(data[[col]], hex_to_rgb)) %>%
+    as.data.frame()
+  
+  colnames(rgb_vals) <- c(
+    paste0(prefix, "_r"),
+    paste0(prefix, "_g"),
+    paste0(prefix, "_b")
+  )
+  
+  bind_cols(data, rgb_vals)
+}
+
+timetable_encoded <- timetable_imputed %>%
+  one_hot_encode("platform_code") %>%
+  one_hot_encode("day_type") %>%
+  one_hot_encode("wheelchair_accessible") %>%
+  hex_to_rgb_df("route_color", prefix = "route") %>%
+  frequency_encode("route_short_name") %>%
+  frequency_encode("trip_headsign") %>%
+  frequency_encode("stop_name") %>%
+  select(
+    -route_color,
+    -route_short_name,
+    -trip_headsign,
+    -stop_name
+  )
+
+glimpse(timetable_encoded)
+colnames(timetable_encoded)
+
 
 # ===
 # 9.1 Renaming days
@@ -334,67 +435,67 @@ glimpse(timetable_imputed)
 # these represent if trip takes place on that day
 # monday actually represnt weekday
 
-timetable_imputed <- timetable_imputed %>%
-  rename(weekday = monday)
-
-table(timetable_imputed$day_type)
+# timetable_imputed <- timetable_imputed %>%
+#   rename(weekday = monday)
+# 
+# table(timetable_imputed$day_type)
 
 # ===
 # 9.2 char cols with high cardinality
 # ===
-
-timetable_encoded <- timetable_imputed %>%
-  separate(
-    trip_id,
-    into = c("trip_part_1", "trip_part_2", "trip_part_3", "trip_part_4"),
-    sep = "_",
-    convert = TRUE
-  )
-
-# Dropping high cardinlity trip parts
-
-cols_to_drop = c('trip_part_3', 'trip_part_4')
-
-timetable_encoded <- timetable_encoded %>%
-  select(-all_of(cols_to_drop))
+# 
+# timetable_encoded <- timetable_imputed %>%
+#   separate(
+#     trip_id,
+#     into = c("trip_part_1", "trip_part_2", "trip_part_3", "trip_part_4"),
+#     sep = "_",
+#     convert = TRUE
+#   )
+# 
+# # Dropping high cardinlity trip parts
+# 
+# cols_to_drop = c('trip_part_3', 'trip_part_4')
+# 
+# timetable_encoded <- timetable_encoded %>%
+#   select(-all_of(cols_to_drop))
+# 
+# glimpse(timetable_encoded)
 
 # ===
 # 9.3 Cols with low cardinality
 # ===
 
 # choose low-cardinality categorical columns
-low_cardinality_cols <- c(
-  "trip_headsign",
-  "wheelchair_accessible",
-  "platform_code",
-  "route_short_name",
-  "stop_name",
-  "route_color",
-  'trip_part_1',
-  'trip_part_2',
-  'day_type'
-)
+# low_cardinality_cols <- c(
+#   # "trip_headsign",
+#   "wheelchair_accessible",
+#   "platform_code",
+#   # "route_short_name",
+#   # "stop_name",
+#   # "route_color",
+#   # 'trip_part_1',
+#   # 'trip_part_2',
+#   'day_type'
+# )
+# 
+# 
+# # convert to factors
+# timetable_encoded <- timetable_encoded %>%
+#   mutate(across(all_of(low_cardinality_cols), as.factor))
+# 
+# # one-hot encode only these columns
+# dummy_matrix <- model.matrix(
+#   ~ trip_headsign + wheelchair_accessible + platform_code + route_short_name
+#   + stop_name + route_color + trip_part_1 + trip_part_2 + day_type - 1,
+#   data = timetable_encoded
+# ) %>%
+#   as.data.frame()
+# 
+# # bind encoded columns and drop originals
+# timetable_encoded <- timetable_encoded %>%
+#   select(-all_of(low_cardinality_cols)) %>%
+#   bind_cols(dummy_matrix)
 
-
-# convert to factors
-timetable_encoded <- timetable_encoded %>%
-  mutate(across(all_of(low_cardinality_cols), as.factor))
-
-# one-hot encode only these columns
-dummy_matrix <- model.matrix(
-  ~ trip_headsign + wheelchair_accessible + platform_code + route_short_name
-  + stop_name + route_color + trip_part_1 + trip_part_2 + day_type - 1,
-  data = timetable_encoded
-) %>%
-  as.data.frame()
-
-# bind encoded columns and drop originals
-timetable_encoded <- timetable_encoded %>%
-  select(-all_of(low_cardinality_cols)) %>%
-  bind_cols(dummy_matrix)
-
-glimpse(timetable_encoded)
-colnames(timetable_encoded)
 
 
 # =========================
@@ -402,7 +503,7 @@ colnames(timetable_encoded)
 # =========================
 
 # ===
-# 10.1 Selecting predictors
+# 10.1 Correlation filtering (mainly for regression models)
 # ===
 
 select_correlated_features <- function(data, target_col, min_abs_cor = 0.1, top_n = NULL) {
@@ -439,44 +540,10 @@ select_correlated_features <- function(data, target_col, min_abs_cor = 0.1, top_
   return(cor_df)
 }
 
-# selected_features <- c(
-#   # Target
-#   "segment_time_s",
-#   
-#   # Core signal
-#   "segment_distance_m",
-#   "time_since_last_stop",
-#   
-#   # Temporal
-#   "arrival_time_hour",
-#   "arrival_time_minute",
-#   
-#   # Spatial
-#   "stop_lat",
-#   "stop_lon",
-#   
-#   # Trip context
-#   "direction_id",
-#   
-#   # Encoded categorical (reduced set)
-#   "trip_headsignHlavná stanica",
-#   "trip_headsignNám. Ľ. Štúra",
-#   
-#   # Platform
-#   "platform_codeB",
-#   "platform_codeD",
-#   
-#   # Day type
-#   "day_typeweekday",
-#   "day_typesunday",
-#   
-#   # Route
-#   "route_short_name139"
-# )
 selected_cor_df <- select_correlated_features(
   data = timetable_encoded,
   target_col = "segment_time_s",
-  min_abs_cor = 0.2
+  min_abs_cor = 0.05
 )
 
 print(selected_cor_df)
@@ -484,37 +551,263 @@ print(selected_cor_df)
 subset_data <- timetable_encoded %>%
   select(all_of(append('segment_time_s', selected_cor_df %>% pull(feature))))
 
-# these are actually highly intercorrelated
-drop_cols <- c('route_short_name139', 'trip_part_1139009', 'route_colorF56200')
+# ===
+# 10.1 Remove multicollinearity
+# ===
 
-subset_data <- subset_data %>%
-  select(-all_of(drop_cols))
+# collinear_features <- c('route_short_name139', 'trip_part_1139009',
+                        # 'route_colorF56200', 'trip_headsignCintorín Slávičie')
+collinear_features <- c()
+
+subset_data_filtered <- subset_data %>%
+  select(-all_of(collinear_features))
+
 
 # ===
 # 10.2 Corr matrix
 # ===
+# 
+# cor_matrix <- cor(subset_data_filtered, use = "complete.obs")
+# 
+# cor_long <- as.data.frame(as.table(cor_matrix))
+# colnames(cor_long) <- c("Var1", "Var2", "Correlation")
+# 
+# # ===
+# # 10.3 Plotting heatmap
+# # ===
+# 
+# ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+#   geom_tile() +
+#   
+#   # this adds correlation values inside the heatmap but only those above
+#   # certain value to improve readability
+#   geom_text(
+#     aes(label = ifelse(abs(Correlation) > 0.3, round(Correlation, 2), "")),
+#     size = 3
+#   ) +
+#   
+#   scale_fill_gradient2(
+#     low = "blue",
+#     mid = "white",
+#     high = "red",
+#     midpoint = 0
+#   ) +
+#   theme_minimal() +
+#   theme(
+#     axis.text.x = element_text(angle = 45, hjust = 1),
+#     axis.title = element_blank()
+#   ) +
+#   ggtitle("Correlation Heatmap (Filtered Labels)")
+plot_correlation_heatmap <- function(df, threshold = 0.3, title = "Correlation Heatmap") {
+  
+  # 1. Calculate correlation matrix (only for numeric columns)
+  # It's safer to filter for numeric variables automatically
+  cor_matrix <- df %>%
+    select(where(is.numeric)) %>%
+    cor(use = "complete.obs")
+  
+  # 2. Convert to long format
+  cor_long <- as.data.frame(as.table(cor_matrix))
+  colnames(cor_long) <- c("Var1", "Var2", "Correlation")
+  
+  # 3. Create the plot
+  ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+    geom_tile() +
+    # Dynamic label filtering based on the 'threshold' argument
+    geom_text(
+      aes(label = ifelse(abs(Correlation) > threshold, round(Correlation, 2), "")),
+      size = 3,
+      color = "black"
+    ) +
+    scale_fill_gradient2(
+      low = "#377eb8",  # Nice blue
+      mid = "white",
+      high = "#e41a1c", # Nice red
+      midpoint = 0,
+      limit = c(-1, 1)   # Ensures the scale is always centered
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title = element_blank(),
+      panel.grid = element_blank()
+    ) +
+    ggtitle(title)
+}
 
-cor_matrix <- cor(subset_data, use = "complete.obs")
+plot_correlation_heatmap(subset_data_filtered, threshold = 0.1)
 
-cor_long <- as.data.frame(as.table(cor_matrix))
-colnames(cor_long) <- c("Var1", "Var2", "Correlation")
+# =========================
+# 11. Outliers
+# =========================
 
 # ===
-# 10.3 Plotting heatmap
+# 11.1 Visualization
 # ===
 
-ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
-  geom_tile() +
-  scale_fill_gradient2(
-    low = "blue",
-    mid = "white",
-    high = "red",
-    midpoint = 0
-  ) +
+# ==
+# 11.1.1 Boxplots
+# ==
+
+# Convert to long format
+subset_long <- subset_data_filtered %>%
+  pivot_longer(
+    cols = -segment_time_s,
+    names_to = "feature",
+    values_to = "value"
+  )
+
+# Boxplots
+# ggplot(subset_long, aes(x = feature, y = value)) +
+#   geom_boxplot(outlier.color = "red", outlier.alpha = 0.5) +
+#   coord_flip() +
+#   theme_minimal() +
+#   ggtitle("Boxplots of Features (Outlier Detection)")
+# 
+# Reusable plotting function
+# Reusable function for boxplots
+plot_box_dist <- function(df, var_name) {
+  ggplot(df, aes(x = !!sym(var_name))) +
+    # Adding a dummy y-axis value or a factor(0) helps boxplot orientation
+    geom_boxplot(fill = "lightblue", outlier.color = "red", outlier.alpha = 0.5) +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = paste("Feature:", var_name),
+      x = NULL # Removing x label as the title covers it
+    )
+}
+# 1. Identify columns (all except the time/ID column)
+is_binary <- map_lgl(subset_data_filtered, ~length(unique(na.omit(.x))) <= 2)
+binary_cols <- names(is_binary[is_binary])
+
+# 2. Identify the predictors you actually want to plot
+# We exclude 'segment_time_s' AND all identified binary columns
+predictors_to_plot <- setdiff(names(subset_data_filtered), c("segment_time_s", binary_cols))
+
+# 3. Print a little heads-up so you know what was dropped
+message("Dropping binary features: ", paste(binary_cols, collapse = ", "))
+# 2. Use map to create a list of individual plots
+# .x passes the column name string to the var_name argument
+plot_list <- map(predictors_to_plot, ~plot_box_dist(subset_data_filtered, .x))
+
+# 3. Combine with patchwork
+# wrap_plots handles the list directly
+combined_plot <- wrap_plots(plot_list, ncol = 3) + 
+  plot_annotation(
+    title = "Outlier Detection Across Predictors",
+    subtitle = "Boxplots identifying potential outliers in red",
+    theme = theme(plot.title = element_text(size = 18, face = "bold"))
+  )
+
+# 4. Display
+print(combined_plot)
+
+summary(subset_data_transformed %>% select(all_of(predictors_to_plot)))
+
+# # ==
+# # 11.1.2 Histograms
+# # ==
+# 
+# ggplot(subset_long, aes(x = value)) +
+#   geom_histogram(bins = 50, fill = "grey", color = "black") +
+#   facet_wrap(~ feature, scales = "free") +
+#   theme_minimal() +
+#   ggtitle("Feature Distributions")
+# 
+# 
+# ggplot(subset_long, aes(x = value, y = segment_time_s)) +
+#   geom_point(alpha = 0.2) +
+#   facet_wrap(~ feature, scales = "free_x") +
+#   theme_minimal() +
+#   ggtitle("Feature vs Target (Outlier Detection)")
+
+# ===
+# 11.2 Transformations
+# ===
+
+# ==
+# 11.2.1 Log-scale
+# ==
+
+# transforming segment_distnace_m as it is skewed, others are fine
+# subset_data_filtered <- subset_data_filtered %>%
+#   select(-all_of(c('segment_distance_log')))
+
+subset_data_transformed <- subset_data_filtered %>%
+  mutate(segment_distance_m = log1p(segment_distance_m))
+
+# ==
+# 11.2.2 Feature engineering
+# ==
+
+# subset_data_transformed <- subset_data_transformed %>%
+#   select(-all_of(c('segment_distance_log')))
+
+subset_data_transformed <- subset_data_transformed %>%
+  mutate(distance_time_interaction = segment_distance_m * arrival_time_hour)
+
+subset_data_transformed <- subset_data_transformed %>%
+  mutate(speed_est = segment_distance_m / (time_since_last_stop + 1))
+
+
+plot_correlation_heatmap(subset_data_transformed)
+
+
+# =========================
+# 12. Model Training
+# =========================
+
+# ===
+# 12.1 Train / test split
+# ===
+
+set.seed(42)
+
+# 80/20 split
+train_idx <- sample(seq_len(nrow(subset_data_transformed)), size = 0.8 * nrow(subset_data_transformed))
+
+train_data <- subset_data_transformed[train_idx, ]
+test_data  <- subset_data_transformed[-train_idx, ]
+
+# ===
+# 12.2 Linear regression
+# ===
+
+lm_model <- lm(segment_time_s ~ ., data = train_data)
+summary(lm_model)
+
+# test data
+
+predictions <- predict(lm_model, newdata = test_data)
+
+rmse <- sqrt(mean((test_data$segment_time_s - predictions)^2))
+rmse
+
+mae <- mean(abs(test_data$segment_time_s - predictions))
+mae
+
+ss_total <- sum((test_data$segment_time_s - mean(test_data$segment_time_s))^2)
+ss_res   <- sum((test_data$segment_time_s - predictions)^2)
+
+r2_test <- 1 - (ss_res / ss_total)
+r2_test
+
+library(ggplot2)
+
+ggplot(data.frame(actual = test_data$segment_time_s, pred = predictions),
+       aes(x = actual, y = pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
   theme_minimal() +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    axis.title = element_blank()
-  ) +
-  ggtitle("Correlation Heatmap (Selected Features + Target)")
+  ggtitle("Predicted vs Actual")
+
+
+ggplot(data.frame(pred = predictions, residuals = test_data$segment_time_s - predictions),
+       aes(x = pred, y = residuals)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  ggtitle("Residuals vs Predictions")
+
 
