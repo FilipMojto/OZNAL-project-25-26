@@ -18,6 +18,11 @@ timetable <- read_csv("../data/interim/dataset.csv")
 
 # timetable <- timetable %>% head(n=10000)
 
+timetable <- timetable %>%
+  group_by(day_type) %>%  # important variable
+  sample_frac(0.1) %>%   # 10% sample
+  ungroup()
+
 # =========================
 # Basic info
 # =========================
@@ -76,6 +81,7 @@ constant_features
 # 2.2 Near-zero variance (should be dropped too, too weak predictors)
 # ===
 
+
 # formula: ratio = freq_1 / freq_2
 nzv_summary <- timetable %>%
   summarise(across(everything(), ~ {
@@ -113,11 +119,19 @@ print(paste("Duplicate rows:", dup_row_indexes))
 # 4.2 Duplicate cols (should be removed)
 # ===
 
+find_duplicate_columns <- function(df) {
+  dup_col_indexes <- which(duplicated(as.list(df)))
+  dup_cols <- names(df)[dup_col_indexes]
+  
+  return(dup_cols)
+}
+
 # More efficient check for duplicate columns
 # R looks at the "top level" of the data frame. duplicated() now looks at each 
 # vector (column) as a single item in a list and compares them.
-dup_col_indexes <- which(duplicated(as.list(timetable)))
-dup_cols <- names(timetable)[dup_col_indexes]
+# dup_col_indexes <- which(duplicated(as.list(timetable)))
+# dup_cols <- names(timetable)[dup_col_indexes]
+dup_cols <- find_duplicate_columns(timetable)
 
 paste("Duplicate cols")
 dup_cols
@@ -261,10 +275,12 @@ timetable_reduced <- drop_cols_report(timetable_reduced, dup_cols)
 # glimpse(timetable_reduced)
 
 # ===
-# 7.8 Highly correlated char cols
+# 7.8 Irrelevant cols
 # ===
-# these were broken into multiple numerical cols, they would be hihghly correlated
+# these were used during extraction process and were broken into several predictors
 # ===
+
+
 
 highly_correlated_char = c('arrival_time', 'service_id', 'shape_id', 'stop_id',
                            'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
@@ -331,17 +347,17 @@ dim(timetable_imputed)
 glimpse(timetable_imputed)
 
 
+
+# =========================
+# 9. Handling categorical values
+# =========================
+
 # Scan all character columns and count unique values
 unique_counts <- timetable_imputed %>%
   summarise(across(where(is.character), ~n_distinct(.))) %>%
   pivot_longer(cols = everything(), names_to = "column_name", values_to = "unique_count")
 
 print(unique_counts)
-
-
-# =========================
-# 9. Handling categorical values
-# =========================
 
 # =========================================================
 # 1. One-hot encoding for low-cardinality predictors
@@ -383,7 +399,7 @@ frequency_encode <- function(data, col, new_col = NULL) {
 }
 
 # =========================================================
-# 7. Hex color -> RGB
+# 3. Hex color -> RGB
 #    Good for route_color if you want numeric representation
 #    without category explosion.
 # =========================================================
@@ -410,23 +426,54 @@ hex_to_rgb_df <- function(data, col = "route_color", prefix = "route") {
   bind_cols(data, rgb_vals)
 }
 
+table(timetable_encoded$day_typeweekday)
+
+
+
 timetable_encoded <- timetable_imputed %>%
   one_hot_encode("platform_code") %>%
   one_hot_encode("day_type") %>%
+  one_hot_encode("zone_id") %>%
+  one_hot_encode("direction_id") %>%
   one_hot_encode("wheelchair_accessible") %>%
+  one_hot_encode("pickup_type") %>%
+  one_hot_encode("route_type") %>%
   hex_to_rgb_df("route_color", prefix = "route") %>%
   frequency_encode("route_short_name") %>%
+  frequency_encode("route_id") %>%
   frequency_encode("trip_headsign") %>%
   frequency_encode("stop_name") %>%
+  frequency_encode("stop_code") %>%
   select(
     -route_color,
     -route_short_name,
+    -route_id,
     -trip_headsign,
-    -stop_name
+    -stop_name,
+    -stop_code
   )
 
+
+# ===
+# 9.1 Check duplicate cols again
+# ===
+
+dup_cols = find_duplicate_columns(timetable_encoded)
+print(dup_cols)
+
+timetable_encoded <- drop_cols_report(timetable_encoded, dup_cols)
+
 glimpse(timetable_encoded)
-colnames(timetable_encoded)
+table(timetable_encoded$platform_codeI)
+
+
+
+
+
+# =========================
+# 10. Save dataset
+# =========================
+saveRDS(timetable_encoded, "./datasets/timetable_encoded.rds")
 
 
 # ===
@@ -503,13 +550,29 @@ colnames(timetable_encoded)
 # =========================
 
 # ===
+# 10.1 Load dataset
+# ===
+
+
+
+# ===
 # 10.1 Correlation filtering (mainly for regression models)
 # ===
 
-select_correlated_features <- function(data, target_col, min_abs_cor = 0.1, top_n = NULL) {
-  # keep only numeric columns
+timetable_encoded <- readRDS("./datasets/timetable_encoded.rds")
+
+glimpse(timetable_encoded)
+
+select_correlated_features <- function(
+    data,
+    target_col,
+    min_abs_cor = 0.1,
+    top_n = NULL,
+    always_keep = NULL
+) {
+  # keep only numeric columns for correlation
   numeric_data <- data %>%
-    select(where(is.numeric))
+    dplyr::select(where(is.numeric))
   
   # check target exists
   if (!(target_col %in% names(numeric_data))) {
@@ -523,46 +586,62 @@ select_correlated_features <- function(data, target_col, min_abs_cor = 0.1, top_
     feature = names(cor_vec),
     correlation = as.numeric(cor_vec)
   ) %>%
-    filter(feature != target_col) %>%
-    mutate(abs_correlation = abs(correlation)) %>%
-    arrange(desc(abs_correlation))
+    dplyr::filter(feature != target_col) %>%
+    dplyr::mutate(abs_correlation = abs(correlation)) %>%
+    dplyr::arrange(desc(abs_correlation))
   
   # threshold filter
   cor_df <- cor_df %>%
-    filter(abs_correlation >= min_abs_cor)
+    dplyr::filter(abs_correlation >= min_abs_cor)
   
   # optional top_n restriction
   if (!is.null(top_n)) {
     cor_df <- cor_df %>%
-      slice_head(n = top_n)
+      dplyr::slice_head(n = top_n)
   }
   
-  return(cor_df)
+  # final feature list
+  selected_features <- unique(c(
+    target_col,
+    cor_df$feature,
+    always_keep
+  ))
+  
+  # keep only existing columns (safe)
+  selected_features <- intersect(selected_features, names(data))
+  
+  return(data %>%
+           dplyr::select(all_of(selected_features)))
 }
-
-selected_cor_df <- select_correlated_features(
+  
+  # return(cor_df)
+# }
+# 
+subset_data <- select_correlated_features(
   data = timetable_encoded,
   target_col = "segment_time_s",
-  min_abs_cor = 0.05
+  min_abs_cor = 0.05,
+  always_keep = c("seconds_since_midnight", "route_short_name_freq")
 )
 
-print(selected_cor_df)
+glimpse(subset_data)
 
-subset_data <- timetable_encoded %>%
-  select(all_of(append('segment_time_s', selected_cor_df %>% pull(feature))))
+
+# subset_data <- timetable_encoded %>%
+#   select(all_of(append('segment_time_s', selected_cor_df %>% pull(feature))))
 
 # ===
 # 10.1 Remove multicollinearity
 # ===
 
 # collinear_features <- c('route_short_name139', 'trip_part_1139009',
-                        # 'route_colorF56200', 'trip_headsignCintorín Slávičie')
+# 'route_colorF56200', 'trip_headsignCintorín Slávičie')
 collinear_features <- c()
 
 subset_data_filtered <- subset_data %>%
   select(-all_of(collinear_features))
-
-
+# 
+# glimpse(subset_data_filtered)
 # ===
 # 10.2 Corr matrix
 # ===
@@ -635,7 +714,7 @@ plot_correlation_heatmap <- function(df, threshold = 0.3, title = "Correlation H
     ggtitle(title)
 }
 
-plot_correlation_heatmap(subset_data_filtered, threshold = 0.1)
+# plot_correlation_heatmap(subset_data_filtered, threshold = 0.1)
 
 # =========================
 # 11. Outliers
@@ -650,12 +729,12 @@ plot_correlation_heatmap(subset_data_filtered, threshold = 0.1)
 # ==
 
 # Convert to long format
-subset_long <- subset_data_filtered %>%
-  pivot_longer(
-    cols = -segment_time_s,
-    names_to = "feature",
-    values_to = "value"
-  )
+# subset_long <- subset_data_filtered %>%
+#   pivot_longer(
+#     cols = -segment_time_s,
+#     names_to = "feature",
+#     values_to = "value"
+#   )
 
 # Boxplots
 # ggplot(subset_long, aes(x = feature, y = value)) +
@@ -677,33 +756,71 @@ plot_box_dist <- function(df, var_name) {
       x = NULL # Removing x label as the title covers it
     )
 }
-# 1. Identify columns (all except the time/ID column)
-is_binary <- map_lgl(subset_data_filtered, ~length(unique(na.omit(.x))) <= 2)
-binary_cols <- names(is_binary[is_binary])
-
-# 2. Identify the predictors you actually want to plot
-# We exclude 'segment_time_s' AND all identified binary columns
-predictors_to_plot <- setdiff(names(subset_data_filtered), c("segment_time_s", binary_cols))
-
-# 3. Print a little heads-up so you know what was dropped
-message("Dropping binary features: ", paste(binary_cols, collapse = ", "))
-# 2. Use map to create a list of individual plots
-# .x passes the column name string to the var_name argument
-plot_list <- map(predictors_to_plot, ~plot_box_dist(subset_data_filtered, .x))
-
-# 3. Combine with patchwork
-# wrap_plots handles the list directly
-combined_plot <- wrap_plots(plot_list, ncol = 3) + 
-  plot_annotation(
+# # 1. Identify columns (all except the time/ID column)
+# is_binary <- map_lgl(subset_data_filtered, ~length(unique(na.omit(.x))) <= 2)
+# binary_cols <- names(is_binary[is_binary])
+# 
+# # 2. Identify the predictors you actually want to plot
+# # We exclude 'segment_time_s' AND all identified binary columns
+# predictors_to_plot <- setdiff(names(subset_data_filtered), c("segment_time_s", binary_cols))
+# 
+# # 3. Print a little heads-up so you know what was dropped
+# message("Dropping binary features: ", paste(binary_cols, collapse = ", "))
+# # 2. Use map to create a list of individual plots
+# # .x passes the column name string to the var_name argument
+# plot_list <- map(predictors_to_plot, ~plot_box_dist(subset_data_filtered, .x))
+# 
+# # 3. Combine with patchwork
+# # wrap_plots handles the list directly
+# combined_plot <- wrap_plots(plot_list, ncol = 3) + 
+#   plot_annotation(
+#     title = "Outlier Detection Across Predictors",
+#     subtitle = "Boxplots identifying potential outliers in red",
+#     theme = theme(plot.title = element_text(size = 18, face = "bold"))
+#   )
+# 
+# # 4. Display
+# print(combined_plot)
+plot_predictor_boxplots <- function(
+    df,
+    target_col = "segment_time_s",
+    ncol = 3,
+    show_message = TRUE,
     title = "Outlier Detection Across Predictors",
-    subtitle = "Boxplots identifying potential outliers in red",
-    theme = theme(plot.title = element_text(size = 18, face = "bold"))
-  )
+    subtitle = "Boxplots identifying potential outliers in red"
+) {
+  # Identify binary columns
+  is_binary <- purrr::map_lgl(df, ~ length(unique(stats::na.omit(.x))) <= 2)
+  binary_cols <- names(is_binary[is_binary])
+  
+  # Select predictors to plot
+  predictors_to_plot <- setdiff(names(df), c(target_col, binary_cols))
+  
+  # Optional message
+  if (show_message) {
+    message("Dropping binary features: ", paste(binary_cols, collapse = ", "))
+  }
+  
+  # Create individual plots
+  plot_list <- purrr::map(predictors_to_plot, ~ plot_box_dist(df, .x))
+  
+  # Combine plots
+  combined_plot <- patchwork::wrap_plots(plot_list, ncol = ncol) +
+    patchwork::plot_annotation(
+      title = title,
+      subtitle = subtitle,
+      theme = ggplot2::theme(
+        plot.title = ggplot2::element_text(size = 18, face = "bold")
+      )
+    )
+  
+  return(combined_plot)
+}
 
-# 4. Display
+combined_plot <- plot_predictor_boxplots(subset_data_filtered)
 print(combined_plot)
 
-summary(subset_data_transformed %>% select(all_of(predictors_to_plot)))
+# summary(subset_data_transformed %>% select(all_of(predictors_to_plot)))
 
 # # ==
 # # 11.1.2 Histograms
@@ -734,8 +851,80 @@ summary(subset_data_transformed %>% select(all_of(predictors_to_plot)))
 # subset_data_filtered <- subset_data_filtered %>%
 #   select(-all_of(c('segment_distance_log')))
 
+problematic_features <- c('segment_distance_m', 'time_since_last_stop')
+
+# summary(subset_data_filtered$segment_distance_m)
+# summary(subset_data_filtered$time_since_last_stop)
+# summary(subset_data_filtered$distance_time_interaction)
+
 subset_data_transformed <- subset_data_filtered %>%
-  mutate(segment_distance_m = log1p(segment_distance_m))
+  mutate(across(all_of(problematic_features), log1p))
+
+combined_plot <- plot_predictor_boxplots(subset_data_transformed)
+print(combined_plot)
+
+glimpse(subset_data_transformed)
+
+# =========================
+# 10. Data Engineering
+# =========================
+
+# seconds since midnight problem -> 23 -> far from 0, these are better
+
+timetable_engineered <- subset_data_filtered %>%
+  mutate(
+    sin_time = sin(2 * pi * seconds_since_midnight / 86400),
+    cos_time = cos(2 * pi * seconds_since_midnight / 86400),
+    distance_sin_interaction = segment_distance_m * sin_time,
+    distance_cos_interaction = segment_distance_m * cos_time,
+  )
+
+# timetable_engineered <- timetable_engineered %>%
+#   group_by(route_short_name_freq) %>%
+#   mutate(route_avg_time = mean(segment_time_s))
+
+
+glimpse(timetable_engineered)
+
+# ===
+# Heatmap again
+# ===
+
+timetable_engineered <- select_correlated_features(
+  data = timetable_engineered,
+  target_col = "segment_time_s",
+  min_abs_cor = 0.05
+)
+
+
+# timetable_engineered <- select_correlated_features(
+#   data = timetable_engineered,
+#   target_col = "segment_time_s",
+#   min_abs_cor = 0.05
+# )
+# 
+# subset_data <- timetable_encoded %>%
+#   select(all_of(append('segment_time_s', selected_cor_df %>% pull(feature))))
+
+collinear_features <- c('zone_id101', 'cos_time', 'route_type0', 'stop_code_freq')
+
+timetable_engineered <- timetable_engineered %>%
+  select(-all_of(collinear_features))
+
+plot_correlation_heatmap(timetable_engineered, threshold = 0.1)
+
+
+
+# ===
+# Boxplots again
+# ===
+
+combined_plot <- plot_predictor_boxplots(timetable_engineered)
+print(combined_plot)
+
+summary(timetable_engineered$segment_distance_m)
+summary(timetable_engineered$distance_cos_interaction)
+
 
 # ==
 # 11.2.2 Feature engineering
@@ -744,35 +933,49 @@ subset_data_transformed <- subset_data_filtered %>%
 # subset_data_transformed <- subset_data_transformed %>%
 #   select(-all_of(c('segment_distance_log')))
 
-subset_data_transformed <- subset_data_transformed %>%
-  mutate(distance_time_interaction = segment_distance_m * arrival_time_hour)
+# subset_data_transformed <- subset_data_transformed %>%
+#   mutate(distance_time_interaction = segment_distance_m * arrival_time_hour)
+# 
+# subset_data_transformed <- subset_data_transformed %>%
+#   mutate(speed_est = segment_distance_m / (time_since_last_stop + 1))
 
-subset_data_transformed <- subset_data_transformed %>%
-  mutate(speed_est = segment_distance_m / (time_since_last_stop + 1))
 
-
-plot_correlation_heatmap(subset_data_transformed)
+# plot_correlation_heatmap(subset_data_transformed)
 
 
 # =========================
 # 12. Model Training
 # =========================
 
+
+
 # ===
 # 12.1 Train / test split
 # ===
 
+glimpse(timetable_engineered)
+
 set.seed(42)
 
 # 80/20 split
-train_idx <- sample(seq_len(nrow(subset_data_transformed)), size = 0.8 * nrow(subset_data_transformed))
+train_idx <- sample(seq_len(nrow(timetable_engineered)), size = 0.8 * nrow(timetable_engineered))
 
-train_data <- subset_data_transformed[train_idx, ]
-test_data  <- subset_data_transformed[-train_idx, ]
+train_data <- timetable_engineered[train_idx, ]
+test_data  <- timetable_engineered[-train_idx, ]
 
 # ===
 # 12.2 Linear regression
 # ===
+
+# unimportant_features <- c('time_since_last_stop', 'platform_codeH', 'arrival_seconds')
+unimportant_features <- c('route_b', 'arrival_seconds', 'route_short_name_freq')
+
+
+train_data <- train_data %>%
+  select(-all_of(unimportant_features))
+
+test_data <- test_data %>%
+  select(-all_of(unimportant_features))
 
 lm_model <- lm(segment_time_s ~ ., data = train_data)
 summary(lm_model)
