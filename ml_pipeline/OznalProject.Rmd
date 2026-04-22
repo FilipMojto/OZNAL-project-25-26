@@ -1,0 +1,419 @@
+---
+title: "OznalProject"
+output: html_document
+---
+
+# Predicting Travel Time of Bratislava MHD
+
+## Selecting Data
+
+For the project we selected a publicly available local open dataset available here:
+
+<https://data.bratislava.sk/datasets/aba12fd2cbac4843bc7406151bc66106/about>
+
+This dataset contains raw data collected by MHD Bratislava which are stored in the form of multiple text files connected by foreign keys (similar to relational databases).
+
+The newest data update our project use was released at:
+
+April 17, 2026
+
+## Defining Hypothesis
+
+The project is hypothesis-driven meaning a hypothesis will be evaluated at its end. The hypothesis is stated as follows:
+
+*"We hypothesize that scheduled travel time between two stops in GTFS systems can be predicted from such metrics like euclidean distance, route & stop attributes, geographical metrics like Lon and Lat points, temporal features like arrival times and other metrics."*
+
+## Selecting Scenarios
+
+Based on the hypothesis and data structure we decided to go with these two scenarios:
+
+1.  (Scenario 1) Compare a regression or classification setup across three statistical or machine-learning methods and two feature-space partitioning approaches. Identify which features remain informative across both method families, discuss the implications for explainability, and outline the benefits each approach offers.
+2.  (Scenario 3) Extend your work by comparing algorithmic and embedded feature-selection methods for the same regression or classification task. This task may require some research on your side, as not all necessary information will be taught through the course. Report how many features you ultimately retain, and which features lose statistical significance as you add or remove predictors.
+
+## Analyzing Data
+
+As we mentioned earlier, the we data represent GTFS system of MHD Bratislava which is stored in several .txt files such as:
+
+1.  *stops.txt* (attributes about stops located in Bratislava like Hlavná stanica, Pod stanicou, etc.)
+2.  *trips.txt* (a concrete trip taken by concrete vehicle following concrete stops and of conrete route)
+3.  *stop_times.txt* (attributes about stop times of concrete trip at concrete stop)
+4.  routes.txt (attributes about routes such as route_type managed by MHD)
+5.  and other files
+
+Many of the files or columns are highly sparse and are not provided by MHD (e.g. *frequencies.txt*, *pathways.txt* or columns *bike_allowed*, *stop_headsign* or *shape_dist_traveled).*
+
+When analyzing the dimensions of data it has almost **700k rows** and almost **70** which should be more than satisfactory for training simple regression models like *Linear Regression* or even more complex tree-based models like *Random Forests*.
+
+## EDA
+
+### Libraries
+
+```{r}
+library("tidyverse")
+library("readr")
+library("ggplot2")
+library("patchwork")
+library("dplyr")
+library("purrr")
+```
+
+### Loading Data
+
+Apart from loading dataset, we also perform **stratified_sampling** where we pick 10% of observations for each day_type. This ensures that each category is represented with respect to its proportion in data.
+
+```{r}
+
+timetable <- read_csv("../data/interim/dataset.csv")
+
+table(timetable$day_type)
+
+timetable <- timetable %>%
+  group_by(day_type) %>%  # important variable
+  sample_frac(0.1) %>%   # 10% sample
+  ungroup()
+```
+
+Now we can take a lot at the dataset to see its structure and info about its columns.
+
+```{r}
+
+glimpse(timetable)
+```
+
+### Data Preparation
+
+By performing brief initial inspection of data we noticed several problems:
+
+1.  **Missing or sparse** (some columns clearly contain NA values)
+2.  **Constant or Near-Constant Columns**
+3.  **Uninformative columns** (urls, descriptions, etc.)
+4.  **Unsupported columns types** (strings, time, etc.)
+
+These problems and more will need to be dealt with during this phase. We are going to turn this unsuitable format into nice training-ready data.
+
+#### Utility Functions
+
+In this section we define a set of utility function that we are going to use in the later phases. Both of the functions do the same - they take a vector of columns names or row indices and drop it from the dataset. Apart from this, they also print some nice logs into console about the reduction.
+
+```{r}
+drop_cols_report <- function(data, cols_to_drop) {
+  # 1. Store the initial count
+  col_num_before <- ncol(data)
+  
+  # 2. Perform the drop
+  # We use any_of() instead of all_of() to prevent errors 
+  # if a column was already dropped previously.
+  data_reduced <- data %>%
+    select(!any_of(cols_to_drop))
+  
+  # 3. Calculate difference
+  col_num_after <- ncol(data_reduced)
+  dropped_count <- col_num_before - col_num_after
+  
+  # 4. Print the report
+  message(paste0("Dropped cols: ", dropped_count, 
+                 " - Current size: ", col_num_after))
+  
+  # 5. Return the cleaned dataframe
+  return(data_reduced)
+}
+
+drop_rows_report <- function(data, rows_to_drop) {
+  # 1. Store initial count
+  row_num_before <- nrow(data)
+  
+  # 2. Perform the drop
+  # Using -rows_to_drop handles the removal by index.
+  # We check if rows_to_drop is empty first to avoid returning an empty table.
+  if (length(rows_to_drop) > 0) {
+    data_reduced <- data[-rows_to_drop, ]
+  } else {
+    data_reduced <- data
+  }
+  
+  # 3. Calculate difference
+  row_num_after <- nrow(data_reduced)
+  dropped_count <- row_num_before - row_num_after
+  
+  # 4. Print the report
+  message(paste0("Dropped rows: ", dropped_count, 
+                 " - Current size: ", row_num_after))
+  
+  return(data_reduced)
+}
+
+find_duplicate_columns <- function(df) {
+  # dup_col_indexes <- which(duplicated(as.list(df)))
+  # dup_cols <- names(df)[dup_col_indexes]
+  # 
+  # return(dup_cols)
+  is_dup <- duplicated(as.list(df))
+  
+  dup_summary <- tibble::tibble(
+    column = names(df),
+    is_duplicate = is_dup
+  )
+  
+  return(dup_summary %>% filter(is_duplicate) %>% pull(column))
+}
+```
+
+#### Handling Missing Values
+
+Throughout the following sections we are going to do the same:
+
+1.  Create summaries about columns or rows which are somehow problematic
+2.  Extract the column names or row indexes in the form of vectors
+
+This structured format ensures that they can be effectively dropped by the reusable functions defined earlier.
+
+In the below code we create a summary of missing values for every columns using *is.na()* provided by base R. The summaries are then split into 2 vectors containing:
+
+1.  **low-missing features** (0\>missing_pct\>50): can be kept and handled by methods like imputing, etc.
+2.  **high-missing features**: (missing_pct\>=50): problematic - should be dropped right away
+
+```{r}
+# 1. Missing values
+# =========================
+
+missing_summary <- timetable %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "column", values_to = "missing_count") %>%
+  mutate(missing_pct = missing_count / nrow(timetable) * 100) %>%
+  arrange(desc(missing_pct))
+
+missing_summary
+
+# ===
+# 1.1 Low_missing features (can be kept - must be imputed)
+# ===
+
+low_missing <- missing_summary %>%
+  filter(missing_pct > 0 & missing_pct < 50) %>%
+  pull(column)
+
+low_missing
+
+# ===
+# 1.2 High missing features (must be removed)
+# ===
+
+high_missing <- missing_summary %>%
+  filter(missing_pct >= 50) %>%
+  pull(column)
+
+high_missing
+
+```
+
+#### Constant & Near-Constant Features
+
+These are features that carry no or only minimal signal and would only cause model to overfit they should be dropped too.\
+We identify near-constant features by calculating the ratio between the 2 largest frequencies identified in a column. If this ratio is above 20 we consider this column to be near-constant.
+
+```{r}
+# =========================
+# 2. Constant & Near-Constant features
+# =========================
+variance_summary <- timetable %>%
+  summarise(across(everything(), ~ n_distinct(.))) %>%
+  pivot_longer(cols = everything(), names_to = "column", values_to = "n_unique") %>%
+  arrange(desc(n_unique))
+variance_summary
+
+# ===
+# 2.1 Constant features (should be dropped immediately)
+# ===
+
+constant_features <- variance_summary %>%
+  filter(n_unique == 1) %>% pull(column)
+
+constant_features
+
+# ===
+# 2.2 Near-zero variance (should be dropped too, too weak predictors)
+# ===
+
+
+# formula: ratio = freq_1 / freq_2
+nzv_summary <- timetable %>%
+  summarise(across(everything(), ~ {
+    freq <- sort(table(.), decreasing = TRUE)
+    if (length(freq) <= 1) return(NA)
+    freq[1] / freq[2]
+  })) %>%
+  pivot_longer(cols = everything(), names_to = "column", values_to = "freq_ratio") %>%
+  arrange(desc(freq_ratio))
+
+print(nzv_summary)
+
+# Threshold example: freq_ratio > 20
+nzv_cols <- nzv_summary %>%
+  filter(freq_ratio > 20) %>%
+  pull(column)
+
+print(nzv_cols)
+```
+
+#### Handling Duplicates
+
+Now we also verify whether dataset doesn't contain duplicate rows (stored as vector of row indices) and duplicate columns (stored as vector of column names). Please note that function *find_duplicate_cols* iteratively examines column by column comparing it with previous ones. This way it also finds such columns which contain only NaN values.
+
+```{r}
+
+# =========================
+# 4. Handling duplicates
+# =========================
+
+# ===
+# 4.1 Duplicate rows (should be removed)
+# ===
+
+dup_row_indexes <- timetable %>%
+  duplicated() %>%
+  which()
+
+print(paste("Duplicate rows:", dup_row_indexes))
+
+# ===
+# 4.2 Duplicate cols (should be removed)
+# ===
+
+
+# More efficient check for duplicate columns
+# R looks at the "top level" of the data frame. duplicated() now looks at each 
+# vector (column) as a single item in a list and compares them.
+# dup_col_indexes <- which(duplicated(as.list(timetable)))
+# dup_cols <- names(timetable)[dup_col_indexes]
+dup_cols <- find_duplicate_columns(timetable)
+
+paste("Duplicate cols")
+dup_cols
+```
+
+#### High-cardinality Columns
+
+In this section we create summary about cardinality of character columns by using *n_distinct* and *n_unique* properties. These columns will need to be handled differently from one-hot-encoding since this would result in very large dataset.
+
+```{r}
+
+# =========================
+# 5. High cardinality categorical variables
+# =========================
+cat_summary <- timetable %>%
+  select(where(is.character)) %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(cols = everything(), names_to = "column", values_to = "n_unique") %>%
+  arrange(desc(n_unique))
+
+print(cat_summary)
+
+# ===
+# Columns with too many categories (characters)
+# ===
+high_cardinality <- cat_summary %>%
+  filter(n_unique > 10)
+high_cardinality
+
+high_cardinality_cols <- high_cardinality %>% pull(column)
+high_cardinality_cols
+```
+
+#### Feature Reduction
+
+The problematic features like highly-sparse features, constant or near-constant features are quite useless for models and should be dropped right away using the utility functions.
+
+```{r}
+
+timetable_reduced <- drop_cols_report(timetable, high_missing)
+timetable_reduced <- drop_cols_report(timetable_reduced, constant_features)
+timetable_reduced <- drop_cols_report(timetable_reduced, nzv_cols)
+timetable_reduced <- drop_rows_report(timetable_reduced, dup_row_indexes)
+timetable_reduced <- drop_cols_report(timetable_reduced, dup_cols)
+
+dup_cols
+glimpse(timetable_reduced)
+
+table(timetable_reduced$arrival_time_second)
+# # ===
+# # 7.7 Highly-correlated cols
+# # ===
+# 
+# timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated)
+
+# glimpse(timetable_reduced)
+
+# ===
+# 7.8 Irrelevant cols
+# ===
+# these were used during extraction process and were broken into several predictors
+# ===
+
+
+highly_correlated_char = c('arrival_time', 'service_id', 'shape_id', 'stop_id',
+                           'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+                           'saturday', 'sunday', 'trip_id', 'stop_sequence')
+timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated_char)
+
+# ===
+# 7.8 Irrelevant cols
+# ===
+
+# these should not be in the dataset after extraction update and remove from here!!
+# irrelevant_features = c('day_type')
+
+# timetable_reduced <- drop_cols_report(timetable_reduced, irrelevant_features)
+
+# ===
+# 7.9 Basic info after filtering
+# ===
+dim(timetable_reduced)
+glimpse(timetable_reduced)
+
+```
+
+#### Handling low-missing features
+
+Let's first analyze the low-missing features:
+
+```{r}
+missing_summary %>% filter(missing_pct < 50 & missing_pct > 0)
+```
+
+##### time_since_last_stop
+
+This one is calculated as:
+
+*time_since_last_stop = arrival_seconds - prev(departure_seconds)*
+
+where *prev()* represents the previous stop within a trip (sorted by *stop_sequence*). The NaN values logically represent the first stop within a trip which doesn't have a previous stop. Thus, we apply imputation with 0:
+
+```{r}
+summary(timetable_reduced$time_since_last_stop)
+```
+
+```{r}
+# ===
+# 8.1 Time_since_last_stop
+# ===
+# These are first stops in a trip
+
+timetable_imputed <- timetable_reduced %>%
+  mutate(
+    time_since_last_stop = replace_na(time_since_last_stop, 0)
+  )
+```
+
+##### wheelchair_accessible
+
+```{r}
+table(timetable_imputed$wheelchair_accessible)
+```
+
+```{r}
+# timetable_imputed <- timetable_imputed %>% mutate( wheelchair_accessible = case_when( is.na(wheelchair_accessible) ~ "missing", wheelchair_accessible == 0 ~ "unknown", wheelchair_accessible == 1 ~ "accessible", wheelchair_accessible == 2 ~ "not_accessible", TRUE ~ "other" ), wheelchair_accessible = as.factor(wheelchair_accessible) )
+# 
+# paste0("Wheelchair_accessible after imputing missing vals") 
+# 
+# table(timetable_imputed$wheelchair_accessible)
+```

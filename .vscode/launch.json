@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug builddataset (module)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "data_extraction.build_dataset",
+            // "args": ["--repos", "ansible", "--skip-existing", "--save-after", "500", "--copy-output"],
+            "args": [],
+
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            // 💡 NEW: Add the workspace folder to the Python path
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}" 
+            }
+        }
+    ]
+}

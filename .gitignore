@@ -63,3 +63,5 @@ data/data_bratislava_mhd_timetable_gtfs/Datasets/*.txt
 .env
 ml_pipeline/datasets/*.rds
 ml_pipeline/datasets/**/*.rds
+.Rproj.user
+.positai

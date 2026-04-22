@@ -82,6 +82,10 @@ shapes["d_prev"] = haversine(
     shapes.groupby("shape_id")["shape_pt_lat"].shift(1),
     shapes.groupby("shape_id")["shape_pt_lon"].shift(1),
 )
+
+# duplicate but empty col, drop
+
+
 shapes["shape_dist_traveled"] = shapes.groupby("shape_id")["d_prev"].cumsum().fillna(0)
 
 # For each stop in a trip, find the nearest shape point and get its cumulative distance
@@ -109,6 +113,7 @@ dataset["stop_shape_dist"] = np.concatenate(
 next_shape_dist = dataset.groupby("trip_id")["stop_shape_dist"].shift(-1)
 dataset["segment_distance_m"] = next_shape_dist - dataset["stop_shape_dist"]
 
+dataset = dataset.drop("shape_dist_traveled", axis=1)
 dataset.rename(columns={"stop_shape_dist": "shape_dist_traveled"}, inplace=True)
 
 # --- Arrival time components ---
