@@ -904,6 +904,7 @@ saveRDS(timetable_engineered, './datasets/timetable_engineered.rds')
 
 ```{r}
 library("purrr")
+library("car")
 ```
 
 ### Loading Data
@@ -911,9 +912,45 @@ library("purrr")
 ```{r}
 timetable <- readRDS("./datasets/timetable_engineered.rds")
 
-glimpse(timetable)
+```
+
+### Transformations
+
+```{r}
+# plot_predictor_boxplots(train_data, target_col = 'segment_time_s')
+
+# summary(train_data %>% select(all_of(c('stop_lat', 'arrival_time_second', 'segment_distance_m'))))
+timetable_transformed <- timetable_engineered %>%
+  mutate(
+    segment_distance_m = log1p(segment_distance_m)
+  )
+
+plot_predictor_boxplots(timetable_transformed %>% select(c('segment_distance_m')), target_col = 'segment_time_s')
 
 ```
+```{r}
+sample_data <- timetable_transformed %>%
+  slice_sample(n = 5000)
+
+train_col_names <- colnames(sample_data)
+
+train_col_names <- train_col_names[!train_col_names %in% c('segment_time_s')]
+
+# length(train_col_names)
+length(train_col_names)
+
+# train_col_names <- train_col_names[]
+
+train_col_names <- c("segment_distance_m", 'distance_cos_interaction', 'time_since_last_stop', 'distance_sin_interaction',
+                     'stop_lat', 'stop_lon', 'sin_time', 'cos_time')
+
+
+scatterplot_list <- map(train_col_names, ~plot_scatterplot_line(sample_data, .x))
+
+combined_plot <- patchwork::wrap_plots(scatterplot_list, ncol = 2)
+combined_plot
+```
+
 
 ### Train/Test Split
 
@@ -925,14 +962,18 @@ glimpse(timetable)
 set.seed(42)
 
 # 80/20 split
-train_idx <- sample(seq_len(nrow(timetable)), size = 0.8 * nrow(timetable))
+train_idx <- sample(seq_len(nrow(timetable_transformed)), size = 0.8 * nrow(timetable))
 
 train_data <- timetable[train_idx, ]
 test_data  <- timetable[-train_idx, ]
 
+
 ```
 
 ### Linear Regression
+
+#### Feature Reduction
+
 
 ```{r}
 # unimportant_features <- c('time_since_last_stop', 'platform_codeH', 'arrival_seconds')
@@ -940,50 +981,144 @@ test_data  <- timetable[-train_idx, ]
 
 unimportant_features <- c('seconds_since_midnight', 'platform_codeD',
                           'platform_codeG', 'day_typesaturday', 'day_typesunday',
-                          'distance_sin_interaction')
+                          'platform_codeF',
+                          'platform_codeB', 'platform_codeC',
+                          'direction_id1', 'platform_codeJ', 'platform_codeI', 'route_type11',
+                          'arrival_seconds', 'arrival_time_hour')
 
-```
+# vif>5, handles collinearity
+high_vif <- c('arrival_time_hour', 'arrival_seconds',
+              'pickup_type3', 'route_type11')
+
+high_vif <- c()
 
 train_data <- train_data %>%
-  select(-all_of(unimportant_features))
+  select(-all_of(append(unimportant_features, high_vif)))
 
 test_data <- test_data %>%
-  select(-all_of(unimportant_features))
+  select(-all_of(append(unimportant_features, high_vif)))
 
+plot_correlation_heatmap(train_data, threshold = 0.1)
+```
+
+#### Linearity
+
+# Create individual plots
+  plot_list <- purrr::map(predictors_to_plot, ~ plot_box_dist(df, .x))
+  
+  # Combine plots
+  combined_plot <- patchwork::wrap_plots(plot_list, ncol = ncol) +
+
+```{r}
+### Linearity
+
+plot_scatterplot_line <- function(data, x, y = 'segment_time_s'){
+  ggplot(data, aes(x = .data[[x]], y = .data[[y]])) +
+    geom_point(alpha = 0.2) +
+    geom_smooth(method = "lm", color = "red", se = FALSE) +
+    geom_smooth(method = "loess", color = "blue", se = FALSE) +
+    theme_minimal()
+}
+
+sample_data <- train_data %>%
+  slice_sample(n = 5000)
+
+train_col_names <- colnames(sample_data)
+
+train_col_names <- train_col_names[!train_col_names %in% c('segment_time_s')]
+
+# length(train_col_names)
+
+# train_col_names <- train_col_names[30:]
+
+
+scatterplot_list <- map(train_col_names, ~plot_scatterplot_line(sample_data, .x))
+
+combined_plot <- patchwork::wrap_plots(scatterplot_list, ncol = 2)
+combined_plot
+                                   `
+```
+
+#### Model Fit
 
 ```{r}
 # summary(train_data$seconds_since_midnight)
-lm_model <- lm(segment_time_s ~ ., data = train_data)
-summary(lm_model)
+# lm_model <- lm(segment_time_s ~ ., data = train_data)
+lm_poly <- lm(
+  segment_time_s ~ 
+    segment_distance_m +
+    # distance_sin_interaction +
+    I(distance_sin_interaction^2) +
+    # distance_cos_interaction +
+    I(distance_cos_interaction^2) + .,
+  data = train_data
+)
+summary(lm_poly)
+
+vif(lm_poly)
 ```
-#### test data
+#### Homoscedasticity
 
 ```{r}
-predictions <- predict(lm_model, newdata = test_data)
+plot(lm_model$fitted.values, lm_model$residuals)
+abline(h = 0, col = "red")
 
-rmse <- sqrt(mean((test_data$segment_time_s - predictions)^2))
+data.frame(
+  fitted = fitted(lm_model),
+  residuals = residuals(lm_model)
+) %>%
+  ggplot(aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.2) +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal()
+```
+#### Evaluation
+
+```{r}
+predictions_lm <- predict(lm_poly, newdata = test_data)
+```
+
+##### Errors
+
+```{r}
+rmse <- sqrt(mean((test_data$segment_time_s - predictions_lm)^2))
 rmse
+```
 
-mae <- mean(abs(test_data$segment_time_s - predictions))
+```{r}
+mae <- mean(abs(test_data$segment_time_s - predictions_lm))
 mae
+```
 
+```{r}
 ss_total <- sum((test_data$segment_time_s - mean(test_data$segment_time_s))^2)
-ss_res   <- sum((test_data$segment_time_s - predictions)^2)
-
+ss_res   <- sum((test_data$segment_time_s - predictions_lm)^2)
 r2_test <- 1 - (ss_res / ss_total)
 r2_test
 ```
 
-#### Evaluation
+##### Plots
+
+###### Predicted Vs. Actual
 
 ```{r}
-ggplot(data.frame(actual = test_data$segment_time_s, pred = predictions),
+
+plot_predicted_vs_actual <- function(data, predictions, target = 'segment_time_s'){
+
+ggplot(data.frame(actual = data[[target]], pred = predictions),
        aes(x = actual, y = pred)) +
   geom_point(alpha = 0.3) +
   geom_abline(slope = 1, intercept = 0, color = "red") +
   theme_minimal() +
   ggtitle("Predicted vs Actual")
+}
+
+plot_predicted_vs_actual(test_data, predictions_lm)
+
 ```
+
+
+###### Residuals vs. Predictors
 
 ```{r}
 ggplot(data.frame(pred = predictions, residuals = test_data$segment_time_s - predictions),
@@ -995,3 +1130,30 @@ ggplot(data.frame(pred = predictions, residuals = test_data$segment_time_s - pre
 ```
 
 ### Polynomial Regression
+
+#### Model Fit
+
+```{r}
+lm_poly <- lm(
+  segment_time_s ~ segment_distance_m + I(segment_distance_m^2) + .,
+  data = train_data
+)
+
+summary(lm_poly)
+```
+
+#### Evaluation
+
+```{r}
+predictions_poly <- predict(lm_poly, newdata = test_data)
+```
+
+##### Plots
+
+```{r}
+plot_predicted_vs_actual(test_data, predictions_poly)
+
+rmse <- sqrt(mean((test_data$segment_time_s - predictions_poly)^2))
+rmse
+```
+
