@@ -51,10 +51,7 @@ When analyzing the dimensions of data it has almost **700k rows** and almost **7
 ```{r}
 library("tidyverse")
 library("readr")
-library("ggplot2")
-library("patchwork")
 library("dplyr")
-library("purrr")
 ```
 
 ### Loading Data
@@ -155,6 +152,90 @@ find_duplicate_columns <- function(df) {
   )
   
   return(dup_summary %>% filter(is_duplicate) %>% pull(column))
+}
+
+# =========================================================
+# 1. One-hot encoding for low-cardinality predictors
+#    Returns the original dataset with encoded columns added
+#    and the original column removed.
+# =========================================================
+# one_hot_encode <- function(data, col) {
+#   data[[col]] <- as.factor(data[[col]])
+#   
+#   mm <- model.matrix(
+#     as.formula(paste0("~ `", col, "` - 1")),
+#     data = data
+#   ) %>%
+#     as.data.frame()
+#   
+#   data %>%
+#     bind_cols(mm) %>%
+#     select(-all_of(col))
+# }
+one_hot_encode <- function(data, col) {
+  data[[col]] <- as.factor(data[[col]])
+  
+  mm <- model.matrix(
+    as.formula(paste0("~ `", col, "`")),
+    data = data
+  ) %>%
+    as.data.frame()
+  
+  # remove intercept column
+  mm <- mm %>%
+    dplyr::select(-`(Intercept)`)
+  
+  data %>%
+    dplyr::bind_cols(mm) %>%
+    dplyr::select(-all_of(col))
+}
+
+# =========================================================
+# 2. Frequency encoding
+#    Replaces each category by its relative frequency.
+#    Good for medium/high-cardinality categoricals.
+# =========================================================
+frequency_encode <- function(data, col, new_col = NULL) {
+  if (is.null(new_col)) {
+    new_col <- paste0(col, "_freq")
+  }
+  
+  freq_tbl <- data %>%
+    count(.data[[col]], name = "n") %>%
+    mutate(freq = n / sum(n)) %>%
+    select(all_of(col), freq)
+  
+  data %>%
+    left_join(freq_tbl, by = col) %>%
+    rename(!!new_col := freq)
+}
+
+# =========================================================
+# 3. Hex color -> RGB
+#    Good for route_color if you want numeric representation
+#    without category explosion.
+# =========================================================
+hex_to_rgb_df <- function(data, col = "route_color", prefix = "route") {
+  hex_to_rgb <- function(hex) {
+    hex <- gsub("#", "", as.character(hex))
+    if (is.na(hex) || nchar(hex) != 6) return(c(NA, NA, NA))
+    c(
+      strtoi(substr(hex, 1, 2), 16L),
+      strtoi(substr(hex, 3, 4), 16L),
+      strtoi(substr(hex, 5, 6), 16L)
+    )
+  }
+  
+  rgb_vals <- t(sapply(data[[col]], hex_to_rgb)) %>%
+    as.data.frame()
+  
+  colnames(rgb_vals) <- c(
+    paste0(prefix, "_r"),
+    paste0(prefix, "_g"),
+    paste0(prefix, "_b")
+  )
+  
+  bind_cols(data, rgb_vals)
 }
 ```
 
@@ -324,7 +405,6 @@ high_cardinality_cols
 The problematic features like highly-sparse features, constant or near-constant features are quite useless for models and should be dropped right away using the utility functions.
 
 ```{r}
-
 timetable_reduced <- drop_cols_report(timetable, high_missing)
 timetable_reduced <- drop_cols_report(timetable_reduced, constant_features)
 timetable_reduced <- drop_cols_report(timetable_reduced, nzv_cols)
@@ -406,14 +486,512 @@ timetable_imputed <- timetable_reduced %>%
 
 ##### wheelchair_accessible
 
+Since wheelchair_accessible mostly contains value 1 (which means accessible) and a very small portion of missing values it cannot serve as a reliable predictor and should be dropped too.
+
 ```{r}
 table(timetable_imputed$wheelchair_accessible)
+timetable_imputed <- drop_cols_report(timetable_imputed, c('wheelchair_accessible'))
 ```
 
 ```{r}
-# timetable_imputed <- timetable_imputed %>% mutate( wheelchair_accessible = case_when( is.na(wheelchair_accessible) ~ "missing", wheelchair_accessible == 0 ~ "unknown", wheelchair_accessible == 1 ~ "accessible", wheelchair_accessible == 2 ~ "not_accessible", TRUE ~ "other" ), wheelchair_accessible = as.factor(wheelchair_accessible) )
+# =========================
+# 9. Handling categorical values
+# =========================
+
+# # Scan all character columns and count unique values
+# unique_counts <- timetable_imputed %>%
+#   summarise(across(where(is.character), ~n_distinct(.))) %>%
+#   pivot_longer(cols = everything(), names_to = "column_name", values_to = "unique_count")
 # 
-# paste0("Wheelchair_accessible after imputing missing vals") 
-# 
-# table(timetable_imputed$wheelchair_accessible)
+# print(unique_counts)
+# print(cat_summary)
 ```
+
+#### Feature Encoding
+
+Now, the remaining preprocessing step focuses on encoding categorical and non-ordinal features. Three main techniques were applied:
+
+1.  **One-hot encoding**: Used for categorical features with relatively low cardinality (typically fewer than 15 unique values) to preserve interpretability while avoiding excessive dimensionality.
+2.  **Frequency encoding**: Applied to high-cardinality categorical features, where one-hot encoding would lead to a large number of sparse columns. This approach replaces each category with its relative frequency, retaining distributional information in a compact form.
+3.  **Feature transformation and decomposition**: Certain features were transformed into more informative numerical representations. For example, hexadecimal color codes were decomposed into RGB components.
+
+```{r}
+glimpse(timetable_imputed)
+
+timetable_encoded <- timetable_imputed %>%
+  one_hot_encode("platform_code") %>%
+  one_hot_encode("day_type") %>%
+  one_hot_encode("zone_id") %>%
+  one_hot_encode("direction_id") %>%
+  # one_hot_encode("wheelchair_accessible") %>%
+  one_hot_encode("pickup_type") %>%
+  one_hot_encode("route_type") %>%
+  hex_to_rgb_df("route_color", prefix = "route") %>%
+  frequency_encode("route_short_name") %>%
+  frequency_encode("route_id") %>%
+  frequency_encode("trip_headsign") %>%
+  frequency_encode("stop_name") %>%
+  frequency_encode("stop_code") %>%
+  select(
+    -route_color,
+    -route_short_name,
+    -route_id,
+    -trip_headsign,
+    -stop_name,
+    -stop_code
+  )
+
+dup_cols_2 <- find_duplicate_columns(timetable_encoded)
+dup_cols_2
+
+# timetable_encoded$daytimetable_encoded
+glimpse(timetable_encoded)
+```
+#### Detecting duplicates
+Let's check again whether there are no duplicate columns in the dataset.
+
+```{r}
+dup_cols_2 <- find_duplicate_columns(timetable_encoded)
+dup_cols_2
+
+timetable_encoded <- drop_cols_report(timetable_encoded, dup_cols_2)
+```
+
+
+#### Saving Dataset
+
+```{r}
+# =========================
+# 10. Save dataset
+# =========================
+saveRDS(timetable_encoded, "./datasets/timetable_encoded.rds")
+```
+
+### Training Preparation
+
+Now that issues such as missing values, constant or near-constant features, and appropriate encoding have been addressed, the resulting dataset represents a set of candidate predictors suitable for model training.
+
+In this second phase of exploratory data analysis, the focus shifts from general data quality to model-specific requirements. In particular, we examine:
+
+1. **Multicollinearity** among predictors, which can negatively affect linear models
+2. **Extreme outliers** in feature distributions, which may influence model stability
+3. **The nature of relationships** between predictors and the target variable, including potential non-linear patterns
+
+To support this analysis, various visualization techniques such as heatmaps, boxplots, and scatterplots are employed using libraries like ggplot2. These tools help to better understand how the data aligns with the assumptions and behavior of different regression models.
+
+Based on these insights, appropriate transformations and feature selection strategies are proposed to improve model performance and robustness.
+
+#### Libraries
+
+```{r}
+library("ggplot2")
+library("patchwork")
+```
+
+#### Loading Data
+
+```{r}
+
+timetable_encoded <- readRDS("./datasets/timetable_encoded.rds")
+glimpse(timetable_encoded)
+
+```
+#### Utility Functions
+
+This section contains utility functions that are going to be repeteadly used throughout this phase.
+
+```{r}
+
+select_correlated_features <- function(
+    data,
+    target_col,
+    min_abs_cor = 0.1,
+    top_n = NULL,
+    always_keep = NULL
+) {
+  # keep only numeric columns for correlation
+  numeric_data <- data %>%
+    dplyr::select(where(is.numeric))
+  
+  # check target exists
+  if (!(target_col %in% names(numeric_data))) {
+    stop(paste("Target column", target_col, "must exist and be numeric."))
+  }
+  
+  # compute correlations with target
+  cor_vec <- cor(numeric_data, use = "complete.obs")[, target_col]
+  
+  cor_df <- data.frame(
+    feature = names(cor_vec),
+    correlation = as.numeric(cor_vec)
+  ) %>%
+    dplyr::filter(feature != target_col) %>%
+    dplyr::mutate(abs_correlation = abs(correlation)) %>%
+    dplyr::arrange(desc(abs_correlation))
+  
+  # threshold filter
+  cor_df <- cor_df %>%
+    dplyr::filter(abs_correlation >= min_abs_cor)
+  
+  # optional top_n restriction
+  if (!is.null(top_n)) {
+    cor_df <- cor_df %>%
+      dplyr::slice_head(n = top_n)
+  }
+  
+  # final feature list
+  selected_features <- unique(c(
+    target_col,
+    cor_df$feature,
+    always_keep
+  ))
+  
+  # keep only existing columns (safe)
+  selected_features <- intersect(selected_features, names(data))
+  
+  return(data %>%
+           dplyr::select(all_of(selected_features)))
+}
+
+plot_correlation_heatmap <- function(df, threshold = 0.3, title = "Correlation Heatmap") {
+  
+  # 1. Calculate correlation matrix (only for numeric columns)
+  # It's safer to filter for numeric variables automatically
+  cor_matrix <- df %>%
+    select(where(is.numeric)) %>%
+    cor(use = "complete.obs")
+  
+  # 2. Convert to long format
+  cor_long <- as.data.frame(as.table(cor_matrix))
+  colnames(cor_long) <- c("Var1", "Var2", "Correlation")
+  
+  # 3. Create the plot
+  ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+    geom_tile() +
+    # Dynamic label filtering based on the 'threshold' argument
+    geom_text(
+      aes(label = ifelse(abs(Correlation) > threshold, round(Correlation, 2), "")),
+      size = 3,
+      color = "black"
+    ) +
+    scale_fill_gradient2(
+      low = "#377eb8",  # Nice blue
+      mid = "white",
+      high = "#e41a1c", # Nice red
+      midpoint = 0,
+      limit = c(-1, 1)   # Ensures the scale is always centered
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title = element_blank(),
+      panel.grid = element_blank()
+    ) +
+    ggtitle(title)
+}
+
+plot_box_dist <- function(df, var_name) {
+  ggplot(df, aes(x = !!sym(var_name))) +
+    # Adding a dummy y-axis value or a factor(0) helps boxplot orientation
+    geom_boxplot(fill = "lightblue", outlier.color = "red", outlier.alpha = 0.5) +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = paste(var_name),
+      x = NULL # Removing x label as the title covers it
+    )
+}
+
+plot_predictor_boxplots <- function(
+    df,
+    target_col = "segment_time_s",
+    ncol = 3,
+    show_message = TRUE,
+    title = "Outlier Detection Across Predictors",
+    subtitle = "Boxplots identifying potential outliers in red"
+) {
+  # Identify binary columns
+  is_binary <- purrr::map_lgl(df, ~ length(unique(stats::na.omit(.x))) <= 2)
+  binary_cols <- names(is_binary[is_binary])
+  
+  # Select predictors to plot
+  predictors_to_plot <- setdiff(names(df), c(target_col, binary_cols))
+  
+  # Optional message
+  if (show_message) {
+    message("Dropping binary features: ", paste(binary_cols, collapse = ", "))
+  }
+  
+  # Create individual plots
+  plot_list <- purrr::map(predictors_to_plot, ~ plot_box_dist(df, .x))
+  
+  # Combine plots
+  combined_plot <- patchwork::wrap_plots(plot_list, ncol = ncol) +
+    patchwork::plot_annotation(
+      title = title,
+      subtitle = subtitle,
+      theme = ggplot2::theme(
+        plot.title = ggplot2::element_text(size = 18, face = "bold")
+      )
+    )
+  
+  return(combined_plot)
+}
+
+```
+
+#### Data Engineering
+
+In order to better capture temporal patterns present in the data, the original time variable was transformed into a cyclical representation. Specifically, the variable seconds_since_midnight was mapped onto the unit circle using sine and cosine transformations. This approach preserves the periodic nature of time, ensuring that values close in real-world time (e.g., late night and early morning) are also close in the transformed feature space.
+
+In addition to temporal encoding, interaction features were introduced to model the combined effect of distance and time of day. The features distance_sin_interaction and distance_cos_interaction were created by multiplying the segment distance with the corresponding sine and cosine components. These interaction terms allow the model to capture time-dependent variations in travel behavior, such as differing traffic conditions across the day.
+
+```{r}
+timetable_engineered <- timetable_encoded %>%
+  mutate(
+    sin_time = sin(2 * pi * seconds_since_midnight / 86400),
+    cos_time = cos(2 * pi * seconds_since_midnight / 86400),
+    distance_sin_interaction = segment_distance_m * sin_time,
+    distance_cos_interaction = segment_distance_m * cos_time,
+  )
+```
+
+##### Visualizations
+
+Now let's visualize the engineered features' distributions by plotting histograms:
+
+```{r}
+timetable_engineered %>%
+  select(sin_time, cos_time, distance_sin_interaction, distance_cos_interaction) %>%
+  pivot_longer(cols = everything(), names_to = "feature", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal()
+```
+
+The distributions of the cyclical features *sin_time* and *cos_time* exhibit smooth, symmetric patterns consistent with their trigonometric formulation. Both variables show higher densities near their extreme values (−1 and 1), with a gradual decline toward intermediate values, followed by a mirrored increase.
+
+
+The interaction features, *distance_sin_interaction* and *distance_cos_interaction*, are centered around zero and exhibit approximately bell-shaped distributions, suggesting a near-normal structure. However, the presence of heavy tails reflects the influence of large distance values, resulting in more extreme interaction effects.
+
+To verify the distributions of *sin_time* and *cos_time* even further we can do **circular structure check**.
+
+```{r}
+ggplot(timetable_engineered, aes(x = sin_time, y = cos_time)) +
+  geom_point(alpha = 0.1) +
+  coord_fixed() +
+  theme_minimal()
+```
+
+The joint visualization of these features confirms their correct transformation, forming a well-defined circular structure, which indicates that the periodic nature of time has been successfully preserved.
+
+
+
+```{r}
+
+subset_data <- select_correlated_features(
+  data = timetable_encoded,
+  target_col = "segment_time_s",
+  min_abs_cor = 0.05,
+  always_keep = c("seconds_since_midnight", "route_short_name_freq")
+)
+
+glimpse(subset_data)
+
+
+# subset_data <- timetable_encoded %>%
+#   select(all_of(append('segment_time_s', selected_cor_df %>% pull(feature))))
+
+# ===
+# 10.1 Remove multicollinearity
+# ===
+
+# collinear_features <- c('route_short_name139', 'trip_part_1139009',
+# 'route_colorF56200', 'trip_headsignCintorín Slávičie')
+collinear_features <- c()
+
+subset_data_filtered <- subset_data %>%
+  select(-all_of(collinear_features))
+
+```
+
+#### Checking multicollinearity & target collinearity
+
+One of the requirements of regression models like linear or polynomial regression is that its predictors should not be heavily correlated. To verify this in a neat way we are going to print the correlation matrix in the form of **HeatMap**.
+
+Since there is a lot of features currently in the dataset we apply this 
+
+```{r}
+
+
+timetable_selected <- select_correlated_features(timetable_engineered, min_abs_cor = 0.05, target_col = "segment_time_s")
+
+glimpse(timetable_selected)
+
+# summary(timetable_engineered$arrival_seconds)
+
+
+plot_correlation_heatmap(timetable_selected, threshold = 0.01)
+```
+From the observed results we can tell that there is no serious collinearity among features apart from *cos_time* and *distance_cos_interaction*
+
+```{r}
+correlated_features <- c('cos_time', 'distance_cos_interaction', 'sin_time', 'distance_sin_interaction',
+                         'arrival_seconds', 'seconds_since_midnight')
+
+plot_correlation_heatmap(
+  timetable_engineered %>% 
+    select(all_of(c(correlated_features, "segment_time_s")))
+)
+
+```
+
+```{r}
+highly_collineared_features <- c('zone_id101')
+timetable_engineered <- drop_cols_report(timetable_engineered, highly_collineared_features)
+```
+#### Outliers
+
+Extreme outliers are also problematic for regression models. Let's visualize them using boxplots.
+
+##### Boxplots
+
+```{r}
+combined_plot <- plot_predictor_boxplots(timetable_selected)
+print(combined_plot)
+```
+From the bopxlots that mainly distance and time feature and their interactions have a lot of outliers and that heir distributions are hard to see. Let's analyze this further by inspecting their distributions
+
+##### Distributions
+
+```{r}
+problematic_features <- c('segment_distance_m', 'distance_cos_interaction',
+                          'distance_sin_interaction', 'time_since_last_stop')
+
+plot_boxplot <- function(data, feature){
+  ggplot(data, aes(x = .data[[feature]])) +
+    geom_histogram(bins = 50, fill = "steelblue") +
+    # scale_x_log10() +
+    theme_minimal()
+}
+
+plot_boxplot(timetable_selected, 'segment_distance_m')
+plot_boxplot(timetable_selected, 'time_since_last_stop')
+
+summary(timetable_selected %>% select(all_of(problematic_features)))
+
+```
+##### Transformations
+
+Based on the analysis of the predictors with most outliers and their distributions, we recommend following before using them in training:
+
+1. *segment_distance_m* -> very long tail, strong right skew, **log_transform** recommended
+2. *distance_interactions* -> also heavy tails, caused by distance metric. Log cannot be applied for negative values, so transforming distance and the recomputing is recommended
+3 *time_since_last_stop* -> only moderate skew and some extremes, recommended removal if not significant model
+
+### Saving Data
+
+```{r}
+saveRDS(timetable_engineered, './datasets/timetable_engineered.rds')
+```
+
+
+
+## Model Training
+
+### Libs
+
+```{r}
+library("purrr")
+```
+
+### Loading Data
+
+```{r}
+timetable <- readRDS("./datasets/timetable_engineered.rds")
+
+glimpse(timetable)
+
+```
+
+### Train/Test Split
+
+```{r}
+# ===
+# 12.1 Train / test split
+# ===
+
+set.seed(42)
+
+# 80/20 split
+train_idx <- sample(seq_len(nrow(timetable)), size = 0.8 * nrow(timetable))
+
+train_data <- timetable[train_idx, ]
+test_data  <- timetable[-train_idx, ]
+
+```
+
+### Linear Regression
+
+```{r}
+# unimportant_features <- c('time_since_last_stop', 'platform_codeH', 'arrival_seconds')
+# unimportant_features <- c('route_b', 'arrival_seconds', 'route_short_name_freq')
+
+unimportant_features <- c('seconds_since_midnight', 'platform_codeD',
+                          'platform_codeG', 'day_typesaturday', 'day_typesunday',
+                          'distance_sin_interaction')
+
+```
+
+train_data <- train_data %>%
+  select(-all_of(unimportant_features))
+
+test_data <- test_data %>%
+  select(-all_of(unimportant_features))
+
+
+```{r}
+# summary(train_data$seconds_since_midnight)
+lm_model <- lm(segment_time_s ~ ., data = train_data)
+summary(lm_model)
+```
+#### test data
+
+```{r}
+predictions <- predict(lm_model, newdata = test_data)
+
+rmse <- sqrt(mean((test_data$segment_time_s - predictions)^2))
+rmse
+
+mae <- mean(abs(test_data$segment_time_s - predictions))
+mae
+
+ss_total <- sum((test_data$segment_time_s - mean(test_data$segment_time_s))^2)
+ss_res   <- sum((test_data$segment_time_s - predictions)^2)
+
+r2_test <- 1 - (ss_res / ss_total)
+r2_test
+```
+
+#### Evaluation
+
+```{r}
+ggplot(data.frame(actual = test_data$segment_time_s, pred = predictions),
+       aes(x = actual, y = pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  theme_minimal() +
+  ggtitle("Predicted vs Actual")
+```
+
+```{r}
+ggplot(data.frame(pred = predictions, residuals = test_data$segment_time_s - predictions),
+       aes(x = pred, y = residuals)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, color = "red") +
+  theme_minimal() +
+  ggtitle("Residuals vs Predictions")
+```
+
+### Polynomial Regression
