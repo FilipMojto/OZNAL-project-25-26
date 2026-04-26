@@ -44,7 +44,40 @@ Many of the files or columns are highly sparse and are not provided by MHD (e.g.
 
 When analyzing the dimensions of data it has almost **700k rows** and almost **70** which should be more than satisfactory for training simple regression models like *Linear Regression* or even more complex tree-based models like *Random Forests*.
 
-## EDA
+### Target - Regression or Classification?
+
+The hypothesis states that we are predicting travel time which looks like a typical regression problem. But after analyzing the values of our target variable we got these results:
+
+- 0 - 165 observations
+
+- 15 - 180 observations
+
+- 30 - 195 observations
+
+- ...
+
+- 540 - 2 observations
+
+Although the target takes **discrete values** (mostly multiples of 15 or 60 seconds), it represents an underlying **continuous physical quantity — travel time**. Therefore:
+
+- The variable is **ordered and numeric**, not categorical
+
+- Differences between values are meaningful (e.g., 60 vs 120 seconds)
+
+- Discretization arises from **measurement or schedule rounding**, not from the nature of the phenomenon
+
+As a result, **regression models are appropriate**, since they:
+
+- preserve the **ordinal structure and magnitude differences**
+
+- allow modeling of **continuous relationships** between predictors and travel time
+
+- avoid loss of information that would occur if the problem were treated as classification
+
+```         
+```
+
+## Experimental Setup
 
 ### Libraries
 
@@ -52,7 +85,23 @@ When analyzing the dimensions of data it has almost **700k rows** and almost **7
 library("tidyverse")
 library("readr")
 library("dplyr")
+
+library("ggplot2")
+library("patchwork")
+
+library("purrr")
+library("car")
 ```
+
+### Constants
+
+```{r}
+
+TARGET <- 'segment_time_s'
+
+```
+
+## EDA
 
 ### Loading Data
 
@@ -547,7 +596,9 @@ dup_cols_2
 # timetable_encoded$daytimetable_encoded
 glimpse(timetable_encoded)
 ```
+
 #### Detecting duplicates
+
 Let's check again whether there are no duplicate columns in the dataset.
 
 ```{r}
@@ -556,7 +607,6 @@ dup_cols_2
 
 timetable_encoded <- drop_cols_report(timetable_encoded, dup_cols_2)
 ```
-
 
 #### Saving Dataset
 
@@ -573,20 +623,13 @@ Now that issues such as missing values, constant or near-constant features, and 
 
 In this second phase of exploratory data analysis, the focus shifts from general data quality to model-specific requirements. In particular, we examine:
 
-1. **Multicollinearity** among predictors, which can negatively affect linear models
-2. **Extreme outliers** in feature distributions, which may influence model stability
-3. **The nature of relationships** between predictors and the target variable, including potential non-linear patterns
+1.  **Multicollinearity** among predictors, which can negatively affect linear models
+2.  **Extreme outliers** in feature distributions, which may influence model stability
+3.  **The nature of relationships** between predictors and the target variable, including potential non-linear patterns
 
 To support this analysis, various visualization techniques such as heatmaps, boxplots, and scatterplots are employed using libraries like ggplot2. These tools help to better understand how the data aligns with the assumptions and behavior of different regression models.
 
 Based on these insights, appropriate transformations and feature selection strategies are proposed to improve model performance and robustness.
-
-#### Libraries
-
-```{r}
-library("ggplot2")
-library("patchwork")
-```
 
 #### Loading Data
 
@@ -596,6 +639,7 @@ timetable_encoded <- readRDS("./datasets/timetable_encoded.rds")
 glimpse(timetable_encoded)
 
 ```
+
 #### Utility Functions
 
 This section contains utility functions that are going to be repeteadly used throughout this phase.
@@ -690,6 +734,53 @@ plot_correlation_heatmap <- function(df, threshold = 0.3, title = "Correlation H
     ggtitle(title)
 }
 
+plot_hist_dist <- function(df, var_name, bins = 30, show_density = FALSE) {
+  p <- ggplot(df, aes(x = !!sym(var_name)))
+  
+  if (show_density) {
+    # If density is requested, we must map the y-axis to density
+    p <- p + geom_histogram(
+      aes(y = after_stat(density)),
+      fill = "steelblue", 
+      color = "white", 
+      bins = bins, 
+      alpha = 0.6
+    ) +
+    geom_density(color = "darkblue", linewidth = 1)
+  } else {
+    # Standard count-based histogram
+    p <- p + geom_histogram(
+      fill = "steelblue", 
+      color = "white", 
+      bins = bins, 
+      alpha = 0.8
+    )
+  }
+  
+  p + theme_minimal() +
+    labs(
+      title = paste("Distribution of", var_name),
+      x = var_name,
+      y = if(show_density) "Density" else "Frequency"
+    )
+}
+
+# plot_hist_dist <- function(df, var_name, bins = 30) {
+#   ggplot(df, aes(x = !!sym(var_name))) +
+#     geom_histogram(
+#       fill = "steelblue", 
+#       color = "white", 
+#       bins = bins, 
+#       alpha = 0.8
+#     ) +
+#     theme_minimal() +
+#     labs(
+#       title = paste("Distribution of", var_name),
+#       x = var_name,
+#       y = "Frequency"
+#     )
+# }
+
 plot_box_dist <- function(df, var_name) {
   ggplot(df, aes(x = !!sym(var_name))) +
     # Adding a dummy y-axis value or a factor(0) helps boxplot orientation
@@ -740,6 +831,19 @@ plot_predictor_boxplots <- function(
 
 ```
 
+#### Target Distribution
+
+Now we can also analyze the distribution of our target variable
+
+```{r}
+
+plot_hist_dist(timetable_encoded, TARGET, bins = 30, show_density = FALSE)
+# table(timetable_encoded$segment_time_s)
+summary(timetable_encoded$segment_time_s)
+```
+
+Most observations are concentrated around **60 seconds**, with a gradual tail toward higher values. This indicates that **typical segment travel times are short**, while longer durations occur less frequently but extend the upper range.
+
 #### Data Engineering
 
 In order to better capture temporal patterns present in the data, the original time variable was transformed into a cyclical representation. Specifically, the variable seconds_since_midnight was mapped onto the unit circle using sine and cosine transformations. This approach preserves the periodic nature of time, ensuring that values close in real-world time (e.g., late night and early morning) are also close in the transformed feature space.
@@ -747,13 +851,17 @@ In order to better capture temporal patterns present in the data, the original t
 In addition to temporal encoding, interaction features were introduced to model the combined effect of distance and time of day. The features distance_sin_interaction and distance_cos_interaction were created by multiplying the segment distance with the corresponding sine and cosine components. These interaction terms allow the model to capture time-dependent variations in travel behavior, such as differing traffic conditions across the day.
 
 ```{r}
-timetable_engineered <- timetable_encoded %>%
-  mutate(
-    sin_time = sin(2 * pi * seconds_since_midnight / 86400),
-    cos_time = cos(2 * pi * seconds_since_midnight / 86400),
-    distance_sin_interaction = segment_distance_m * sin_time,
-    distance_cos_interaction = segment_distance_m * cos_time,
-  )
+timetable_engineered <- add_engineered_features(timetable_encoded)
+
+# timetable_engineered <- timetable_encoded %>%
+#   mutate(
+#     sin_time = sin(2 * pi * seconds_since_midnight / 86400),
+#     cos_time = cos(2 * pi * seconds_since_midnight / 86400),
+#     distance_sin_interaction = segment_distance_m * sin_time,
+#     distance_cos_interaction = segment_distance_m * cos_time,
+#   )
+
+glimpse(timetable_engineered)
 ```
 
 ##### Visualizations
@@ -772,7 +880,6 @@ timetable_engineered %>%
 
 The distributions of the cyclical features *sin_time* and *cos_time* exhibit smooth, symmetric patterns consistent with their trigonometric formulation. Both variables show higher densities near their extreme values (−1 and 1), with a gradual decline toward intermediate values, followed by a mirrored increase.
 
-
 The interaction features, *distance_sin_interaction* and *distance_cos_interaction*, are centered around zero and exhibit approximately bell-shaped distributions, suggesting a near-normal structure. However, the presence of heavy tails reflects the influence of large distance values, resulting in more extreme interaction effects.
 
 To verify the distributions of *sin_time* and *cos_time* even further we can do **circular structure check**.
@@ -786,10 +893,7 @@ ggplot(timetable_engineered, aes(x = sin_time, y = cos_time)) +
 
 The joint visualization of these features confirms their correct transformation, forming a well-defined circular structure, which indicates that the periodic nature of time has been successfully preserved.
 
-
-
 ```{r}
-
 subset_data <- select_correlated_features(
   data = timetable_encoded,
   target_col = "segment_time_s",
@@ -800,19 +904,26 @@ subset_data <- select_correlated_features(
 glimpse(subset_data)
 
 
-# subset_data <- timetable_encoded %>%
-#   select(all_of(append('segment_time_s', selected_cor_df %>% pull(feature))))
-
-# ===
-# 10.1 Remove multicollinearity
-# ===
-
-# collinear_features <- c('route_short_name139', 'trip_part_1139009',
-# 'route_colorF56200', 'trip_headsignCintorín Slávičie')
 collinear_features <- c()
 
 subset_data_filtered <- subset_data %>%
   select(-all_of(collinear_features))
+
+
+# --- Engineering --- #
+
+
+add_engineered_features <- function(df){
+  df_engineered <- df %>%
+    mutate(
+      sin_time = sin(2 * pi * seconds_since_midnight / 86400),
+      cos_time = cos(2 * pi * seconds_since_midnight / 86400),
+      distance_sin_interaction = segment_distance_m * sin_time,
+      distance_cos_interaction = segment_distance_m * cos_time,
+    )
+  
+  return(df_engineered)
+}
 
 ```
 
@@ -820,12 +931,10 @@ subset_data_filtered <- subset_data %>%
 
 One of the requirements of regression models like linear or polynomial regression is that its predictors should not be heavily correlated. To verify this in a neat way we are going to print the correlation matrix in the form of **HeatMap**.
 
-Since there is a lot of features currently in the dataset we apply this 
+Since there is a lot of features currently in the dataset we apply this
 
 ```{r}
-
-
-timetable_selected <- select_correlated_features(timetable_engineered, min_abs_cor = 0.05, target_col = "segment_time_s")
+timetable_selected <- select_correlated_features(timetable_engineered, min_abs_cor = 0.1, target_col = "segment_time_s")
 
 glimpse(timetable_selected)
 
@@ -834,6 +943,7 @@ glimpse(timetable_selected)
 
 plot_correlation_heatmap(timetable_selected, threshold = 0.01)
 ```
+
 From the observed results we can tell that there is no serious collinearity among features apart from *cos_time* and *distance_cos_interaction*
 
 ```{r}
@@ -851,6 +961,7 @@ plot_correlation_heatmap(
 highly_collineared_features <- c('zone_id101')
 timetable_engineered <- drop_cols_report(timetable_engineered, highly_collineared_features)
 ```
+
 #### Outliers
 
 Extreme outliers are also problematic for regression models. Let's visualize them using boxplots.
@@ -861,6 +972,7 @@ Extreme outliers are also problematic for regression models. Let's visualize the
 combined_plot <- plot_predictor_boxplots(timetable_selected)
 print(combined_plot)
 ```
+
 From the bopxlots that mainly distance and time feature and their interactions have a lot of outliers and that heir distributions are hard to see. Let's analyze this further by inspecting their distributions
 
 ##### Distributions
@@ -879,16 +991,16 @@ plot_boxplot <- function(data, feature){
 plot_boxplot(timetable_selected, 'segment_distance_m')
 plot_boxplot(timetable_selected, 'time_since_last_stop')
 
-summary(timetable_selected %>% select(all_of(problematic_features)))
+# summary(timetable_selected %>% select(all_of(problematic_features)))
 
 ```
+
 ##### Transformations
 
 Based on the analysis of the predictors with most outliers and their distributions, we recommend following before using them in training:
 
-1. *segment_distance_m* -> very long tail, strong right skew, **log_transform** recommended
-2. *distance_interactions* -> also heavy tails, caused by distance metric. Log cannot be applied for negative values, so transforming distance and the recomputing is recommended
-3 *time_since_last_stop* -> only moderate skew and some extremes, recommended removal if not significant model
+1.  *segment_distance_m* -\> very long tail, strong right skew, **log_transform** recommended
+2.  *distance_interactions* -\> also heavy tails, caused by distance metric. Log cannot be applied for negative values, so transforming distance and the recomputing is recommended 3 *time_since_last_stop* -\> only moderate skew and some extremes, recommended removal if not significant model
 
 ### Saving Data
 
@@ -896,38 +1008,302 @@ Based on the analysis of the predictors with most outliers and their distributio
 saveRDS(timetable_engineered, './datasets/timetable_engineered.rds')
 ```
 
-
-
 ## Model Training
 
-### Libs
+### Utility Functions
 
 ```{r}
-library("purrr")
-library("car")
+# ---- ALTERNATIVE (LESS VISUALLY APPEALING) ----
+# plot_homoscedasticity_plot <- function(fitted, residuals){
+#   data.frame(
+#     fitted = fitted,
+#     residuals = residuals
+#   ) %>%
+#     ggplot(aes(x = fitted, y = residuals)) +
+#     geom_point(alpha = 0.2) +
+#     geom_hline(yintercept = 0, color = "red") +
+#     theme_minimal()
+# }
+plot_homoscedasticity_plot <- function(fitted, residuals){
+  data.frame(
+    fitted = fitted,
+    residuals = residuals
+  ) %>%
+    ggplot(aes(x = fitted, y = residuals)) +
+    
+    # points
+    geom_point(alpha = 0.1, size = 0.6, color = "steelblue") +
+    
+    # horizontal zero line
+    geom_hline(yintercept = 0, color = "red", linewidth = 0.8) +
+    
+    # smooth trend (VERY IMPORTANT)
+    geom_smooth(
+      method = "gam",
+      formula = y ~ s(x, k = 5),
+      color = "orange",
+      se = FALSE,
+      linewidth = 1
+    ) +
+    
+    # optional: highlight spread
+    stat_density_2d(alpha = 0.2, color = "grey50") +
+    
+    theme_minimal() +
+    labs(
+      title = "Residuals vs Fitted Values",
+      subtitle = "Checking homoscedasticity",
+      x = "Fitted values",
+      y = "Residuals"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+}
+
+plot_scale_location <- function(fitted, residuals){
+  data.frame(
+    fitted = fitted,
+    sqrt_abs_resid = sqrt(abs(residuals))
+  ) %>%
+    ggplot(aes(x = fitted, y = sqrt_abs_resid)) +
+    geom_point(alpha = 0.1) +
+    geom_smooth(method = "gam", se = FALSE, color = "blue") +
+    theme_minimal() +
+    labs(
+      title = "Scale-Location Plot",
+      y = "√|Residuals|"
+    )
+}
+
+# --- ALTERNATIVE TO BINNED RELATIONSHIP PLOT ---
+# plot_scatterplot_line <- function(data, x, y = "segment_time_s") {
+#   ggplot(data, aes(x = .data[[x]], y = .data[[y]])) +
+#     geom_point(alpha = 0.08, size = 0.6) +
+#     geom_smooth(method = "lm", color = "red", se = FALSE, linewidth = 0.8) +
+#     geom_smooth(
+#       method = "gam",
+#       formula = y ~ s(x, k = 5),
+#       color = "blue",
+#       se = FALSE,
+#       linewidth = 0.9
+#     ) +
+#     theme_minimal() +
+#     labs(
+#       title = x,
+#       x = x,
+#       y = y
+#     ) +
+#     theme(
+#       plot.title = element_text(size = 10, face = "bold"),
+#       axis.text = element_text(size = 8),
+#       axis.title = element_text(size = 8)
+#     )
+# }
+# scatterplot_list <- purrr::map(
+#   features_to_check,
+#   ~ plot_scatterplot_line(sample_data, .x)
+# )
+# 
+# combined_plot <- patchwork::wrap_plots(scatterplot_list, ncol = 2)
+# 
+# combined_plot
+
+plot_binned_relationship <- function(data, x, y = "segment_time_s", bins = 30, 
+                                     label_size = 12, text_size = 10) {
+  data %>%
+    mutate(bin = ntile(.data[[x]], bins)) %>%
+    group_by(bin) %>%
+    summarise(
+      x_mean = mean(.data[[x]], na.rm = TRUE),
+      y_mean = mean(.data[[y]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    ggplot(aes(x = x_mean, y = y_mean)) +
+    geom_point(size = 1.2, alpha = 0.4) +
+    geom_smooth(aes(color = "Linear"), method = "lm", se = FALSE) +
+    geom_smooth(
+      aes(color = "Non-linear"),
+      method = "gam",
+      formula = y ~ s(x, k = 5),
+      se = FALSE
+    ) +
+    scale_color_manual(
+      name = "Legend", # This name must be identical across all plots
+      values = c("Linear" = "red", "Non-linear" = "blue")
+    ) +
+    theme_minimal() +
+    theme(
+      axis.title = element_text(size = label_size),
+      axis.text = element_text(size = text_size)
+    ) +
+    labs(x = x, y = paste("Mean", y))
+}
+
+# ---- Evaluation ---- #
+
+evaluate_regression <- function(actual, predicted, round_to = NULL, model_name = "model") {
+  if (!is.null(round_to)) {
+    predicted <- round(predicted / round_to) * round_to
+  }
+  
+  rmse <- sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+  mae  <- mean(abs(actual - predicted), na.rm = TRUE)
+  
+  ss_total <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+  ss_res   <- sum((actual - predicted)^2, na.rm = TRUE)
+  r2 <- 1 - (ss_res / ss_total)
+  
+  tibble::tibble(
+    model = model_name,
+    RMSE = rmse,
+    MAE = mae,
+    R2 = r2
+  )
+}
+
+plot_predicted_vs_actual <- function(
+  data,
+  predictions,
+  target = "segment_time_s",
+  title = "Predicted vs Actual Values",
+  add_smooth = TRUE
+) {
+  plot_data <- data.frame(
+    actual = data[[target]],
+    predicted = predictions
+  )
+  
+  # Create perfect line data
+  line_data <- data.frame(
+    x = range(plot_data$actual)
+  )
+  line_data$y <- line_data$x
+  
+  p <- ggplot(plot_data, aes(x = actual, y = predicted)) +
+    
+    geom_point(alpha = 0.25, size = 1, color = "steelblue") +
+    
+    # Perfect prediction line (now mapped → legend works)
+    geom_line(
+      data = line_data,
+      aes(x = x, y = y, color = "Perfect prediction"),
+      linewidth = 1,
+      linetype = "dashed"
+    )
+  
+  if (add_smooth) {
+    p <- p + geom_smooth(
+      aes(color = "Model trend"),
+      method = "gam",
+      formula = y ~ s(x, k = 5),
+      se = FALSE,
+      linewidth = 1
+    )
+  }
+  
+  p +
+    scale_color_manual(
+      name = "Lines",
+      values = c(
+        "Perfect prediction" = "red",
+        "Model trend" = "darkorange"
+      )
+    ) +
+    coord_equal() +
+    theme_minimal() +
+    labs(
+      title = title,
+      subtitle = "Comparison of predictions vs actual values",
+      x = "Actual value",
+      y = "Predicted value"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+# ---- Feature Selection ---- #
+
+select_model_features <- function(data, features = NULL, target = "segment_time_s") {
+  
+  # If NULL or empty → return full dataset
+  if (is.null(features) || length(features) == 0) {
+    return(data)
+  }
+  
+  keep_cols <- unique(c(target, features))
+  
+  missing_cols <- setdiff(keep_cols, names(data))
+  if (length(missing_cols) > 0) {
+    warning("Missing columns: ", paste(missing_cols, collapse = ", "))
+  }
+  
+  data %>%
+    dplyr::select(dplyr::any_of(keep_cols))
+}
+
 ```
 
 ### Loading Data
 
 ```{r}
 timetable <- readRDS("./datasets/timetable_engineered.rds")
-
 ```
 
 ### Transformations
+
+In EDA we identified these predictors with highly skewed distributions:
+
+1.  *segment_distance_m*
+2.  *distance_sin_interaction*
+3.  *distance_cos_interaction*
+
+We recommended applying **log transformation** only to the first feature because
+
+1.  the last 2 feature are calculated from it (dist \* sin_time, dist \* cos_time)
+2.  logarithmic transformations cannot be applied to negative values
+
+Thus after transfromation, we only recompute the remaning two features.
 
 ```{r}
 # plot_predictor_boxplots(train_data, target_col = 'segment_time_s')
 
 # summary(train_data %>% select(all_of(c('stop_lat', 'arrival_time_second', 'segment_distance_m'))))
-timetable_transformed <- timetable_engineered %>%
+
+problematic_features <- c('segment_distance_m', 'distance_sin_interaction',
+                          'distance_cos_interaction')
+
+timetable_transformed <- timetable %>%
   mutate(
     segment_distance_m = log1p(segment_distance_m)
   )
 
-plot_predictor_boxplots(timetable_transformed %>% select(c('segment_distance_m')), target_col = 'segment_time_s')
+timetable_transformed <- add_engineered_features(timetable_transformed)
+
+plot_predictor_boxplots(timetable_transformed %>% select(problematic_features), target_col = 'segment_time_s')
 
 ```
+
+From the box plots above it is clear that the skewness has been successfully eliminated for all the problematic features.
+
+### Checking Relationships
+
+We are going to check the relationships between some of the most useful predictors and target. For the sake of performance, we are going to limit the total size of the dataset. For the sake of clarity, we are going to use binned scatterplots that:
+
+1.  Split into x and y axis to a limited number of bins
+2.  For each bin an average is computed
+3.  For each pair a point is added
+
+This approach notably limits the total number of points in the plot and improves overall clarity. Apart from points, the two lines are dragged through the space:
+
+1.  linear (straight) line which indicates linear relationship
+2.  non-linear (curved) line which indicates polynomial relationship
+
+If both lines significantly overlap, it indicates linear relationship.
+
 ```{r}
 sample_data <- timetable_transformed %>%
   slice_sample(n = 5000)
@@ -941,16 +1317,109 @@ length(train_col_names)
 
 # train_col_names <- train_col_names[]
 
-train_col_names <- c("segment_distance_m", 'distance_cos_interaction', 'time_since_last_stop', 'distance_sin_interaction',
-                     'stop_lat', 'stop_lon', 'sin_time', 'cos_time')
+# features_to_check <- c(
+#   "segment_distance_m",
+#   "distance_cos_interaction",
+#   "distance_sin_interaction",
+#   "time_since_last_stop",
+#   "stop_lat",
+#   "stop_lon"
+#   # "sin_time",
+#   # "cos_time",
+#   # "route_short_name_freq",
+#   # "trip_headsign_freq",
+#   # "stop_name_freq",
+#   # "route_r",
+#   # "route_g",
+#   # "route_b"
+# )
+features_to_check <- c(
+  "segment_distance_m",
+  "distance_cos_interaction",
+  "distance_sin_interaction",
+  "stop_name_freq",
+  "trip_headsign_freq",
+  "route_short_name_freq",
+  "stop_lat",
+  "stop_lon"
+)
 
+# # --- ALTERNATIVE TO BINNED RELATIONSHIP PLOT ---
+# # plot_scatterplot_line <- function(data, x, y = "segment_time_s") {
+# #   ggplot(data, aes(x = .data[[x]], y = .data[[y]])) +
+# #     geom_point(alpha = 0.08, size = 0.6) +
+# #     geom_smooth(method = "lm", color = "red", se = FALSE, linewidth = 0.8) +
+# #     geom_smooth(
+# #       method = "gam",
+# #       formula = y ~ s(x, k = 5),
+# #       color = "blue",
+# #       se = FALSE,
+# #       linewidth = 0.9
+# #     ) +
+# #     theme_minimal() +
+# #     labs(
+# #       title = x,
+# #       x = x,
+# #       y = y
+# #     ) +
+# #     theme(
+# #       plot.title = element_text(size = 10, face = "bold"),
+# #       axis.text = element_text(size = 8),
+# #       axis.title = element_text(size = 8)
+# #     )
+# # }
+# # scatterplot_list <- purrr::map(
+# #   features_to_check,
+# #   ~ plot_scatterplot_line(sample_data, .x)
+# # )
+# # 
+# # combined_plot <- patchwork::wrap_plots(scatterplot_list, ncol = 2)
+# # 
+# # combined_plot
+# 
+# plot_binned_relationship <- function(data, x, y = "segment_time_s", bins = 30, 
+#                                      label_size = 12, text_size = 10) {
+#   data %>%
+#     mutate(bin = ntile(.data[[x]], bins)) %>%
+#     group_by(bin) %>%
+#     summarise(
+#       x_mean = mean(.data[[x]], na.rm = TRUE),
+#       y_mean = mean(.data[[y]], na.rm = TRUE),
+#       .groups = "drop"
+#     ) %>%
+#     ggplot(aes(x = x_mean, y = y_mean)) +
+#     geom_point(size = 1.2, alpha = 0.4) +
+#     geom_smooth(aes(color = "Linear"), method = "lm", se = FALSE) +
+#     geom_smooth(
+#       aes(color = "Non-linear"),
+#       method = "gam",
+#       formula = y ~ s(x, k = 5),
+#       se = FALSE
+#     ) +
+#     scale_color_manual(
+#       name = "Legend", # This name must be identical across all plots
+#       values = c("Linear" = "red", "Non-linear" = "blue")
+#     ) +
+#     theme_minimal() +
+#     theme(
+#       axis.title = element_text(size = label_size),
+#       axis.text = element_text(size = text_size)
+#     ) +
+#     labs(x = x, y = paste("Mean", y))
+# }
 
-scatterplot_list <- map(train_col_names, ~plot_scatterplot_line(sample_data, .x))
+# Note: Ensure TARGET is a string, e.g., TARGET <- "my_column_name"
+binned_plot_list <- purrr::map(
+  features_to_check,
+  ~ plot_binned_relationship(sample_data, .x, y = TARGET, bins = 30, label_size = 8, text_size = 8)
+)
 
-combined_plot <- patchwork::wrap_plots(scatterplot_list, ncol = 2)
-combined_plot
+# guides = "collect": Patchwork looks at all the plots. If it sees that they all have a legend named "Legend" with the same colors, it removes them from the individual plots and creates one single master legend.
+patchwork::wrap_plots(binned_plot_list, ncol = 2, guides = "collect") & 
+  theme(legend.position = "bottom")
 ```
 
+Several predictors—especially interaction terms—demonstrate clear non-linear relationships with the target, indicating that linear models alone may be insufficient and that incorporating non-linear transformations or more flexible models is justified.
 
 ### Train/Test Split
 
@@ -964,196 +1433,221 @@ set.seed(42)
 # 80/20 split
 train_idx <- sample(seq_len(nrow(timetable_transformed)), size = 0.8 * nrow(timetable))
 
-train_data <- timetable[train_idx, ]
-test_data  <- timetable[-train_idx, ]
+train_data <- timetable_transformed[train_idx, ]
+test_data  <- timetable_transformed[-train_idx, ]
+```
 
+### Keep-only Features (for testing)
 
+```{r}
+features_distance <- c("segment_distance_m")
+
+train_data <- select_model_features(train_data, features_distance)
+test_data  <- select_model_features(test_data, features_distance)
 ```
 
 ### Linear Regression
 
-#### Feature Reduction
+#### Feature Selection
 
+Since polynomial regression does not inherently perform feature selection or regularization, an **iterative, model-driven approach** was adopted. The process began with a relatively rich set of predictors, including engineered and interaction features. The model was then repeatedly refined through successive training and evaluation cycles.
+
+After each iteration, the statistical significance of predictors was assessed using the **t-values and corresponding p-values** obtained from the fitted model. Predictors with low statistical significance (i.e., high p-values) were considered uninformative and gradually removed from the feature set.
+
+However, statistical significance alone can be misleading in the presence of **multicollinearity**, which inflates standard errors and destabilizes coefficient estimates. Therefore, the **Variance Inflation Factor (VIF)** was used as a complementary diagnostic tool. Predictors exhibiting high multicollinearity (VIF \> 5) were systematically eliminated to improve model stability and interpretability.
 
 ```{r}
-# unimportant_features <- c('time_since_last_stop', 'platform_codeH', 'arrival_seconds')
-# unimportant_features <- c('route_b', 'arrival_seconds', 'route_short_name_freq')
+unimportant_features <- c('seconds_since_midnight',
+                          'stop_lat',
+                          'arrival_time_second',
+                          'platform_codeH',
+                          'platform_codeJ',
+                          'trip_headsign_freq',
+                          'direction_id1',
+                          'arrival_time_minute',
+                          'platform_codeB',
+                          'platform_codeC')
+high_vif_features <- c('sin_time', 'cos_time', 'route_type11', 'day_typesunday',
+                       'arrival_time_hour', 'arrival_seconds')
+drop_features <- append(unimportant_features, high_vif_features)
 
+
+train_data <- drop_cols_report(train_data, drop_features)
+test_data <- drop_cols_report(test_data, drop_features)
+
+```
+
+#### Model Fit & Evaluation
+
+The linear regression model achieved a **Multiple R² of 0.4155**, indicating that approximately **41.5% of the variance** in the target variable (*segment_time_s*) is explained by the selected predictors.
+
+Although most predictors are statistically significant, the overall performance indicates that the model is **unable to fully capture non-linear relationships** present in the data.
+
+These observations suggest that while the selected features carry meaningful signal, their relationships with the target variable are **not strictly linear**, and thus cannot be adequately modeled using a simple linear framework.
+
+```{r}
+
+lm_model <- lm(segment_time_s ~ ., data = train_data)
+summary(lm_model)
+```
+
+#### VIF
+
+The Variance Inflation Factor (VIF) analysis indicates that **multicollinearity is not a significant concern** in the final linear model. The majority of predictors exhibit very low VIF values, typically close to 1, suggesting minimal linear dependence among features.
+
+```{r}
+
+vif(lm_model)
+```
+
+#### Homoscedasticity
+
+The scale-location plots reveal that the linear regression model exhibits clear heteroscedasticity, particularly for higher fitted values, where the variance of residuals increases substantially. This indicates that the model fails to adequately capture the underlying structure of the data.
+
+```{r}
+plot_scale_location(lm_model$fitted.values, lm_model$residuals)
+```
+
+#### Evaluation
+
+```         
+The linear regression model achieved an RMSE of 31.68 and MAE of 23.61, indicating moderate prediction errors on average. With an R² of 0.409, the model explains approximately 41% of the variance in segment travel time, demonstrating an improvement over the distance-only baseline. This suggests that incorporating additional predictors provides meaningful information beyond distance alone. However, the model still exhibits limitations in capturing more complex, non-linear relationships present in the data, which constrains its overall predictive performance.
+```
+
+```{r}
+predictions_lm <- predict(lm_model, newdata = test_data)
+
+results_lm <- evaluate_regression(
+  actual = test_data$segment_time_s,
+  predicted = predictions_lm,
+  model_name = "Linear Regression"
+)
+
+results_lm
+```
+
+#### Predicted vs. Actual
+
+```{r}
+plot_predicted_vs_actual(
+  data = test_data,
+  predictions = predictions_lm,
+  target = "segment_time_s",
+  title = "Linear Regression: Predicted vs Actual"
+)
+```
+
+### Polynomial Regression
+
+#### Feature Selection
+
+Since polynomial regression does not inherently perform feature selection or regularization, an **iterative, model-driven approach** was adopted. The process began with a relatively rich set of predictors, including engineered and interaction features. The model was then repeatedly refined through successive training and evaluation cycles.
+
+After each iteration, the statistical significance of predictors was assessed using the **t-values and corresponding p-values** obtained from the fitted model. Predictors with low statistical significance (i.e., high p-values) were considered uninformative and gradually removed from the feature set.
+
+However, statistical significance alone can be misleading in the presence of **multicollinearity**, which inflates standard errors and destabilizes coefficient estimates. Therefore, the **Variance Inflation Factor (VIF)** was used as a complementary diagnostic tool. Predictors exhibiting high multicollinearity (VIF \> 5) were systematically eliminated to improve model stability and interpretability.
+
+```{r}
 unimportant_features <- c('seconds_since_midnight', 'platform_codeD',
                           'platform_codeG', 'day_typesaturday', 'day_typesunday',
                           'platform_codeF',
                           'platform_codeB', 'platform_codeC',
                           'direction_id1', 'platform_codeJ', 'platform_codeI', 'route_type11',
-                          'arrival_seconds', 'arrival_time_hour')
+                          'arrival_seconds', 'arrival_time_hour',
+                          'route_short_name_freq', 'arrival_time_minute')
 
 # vif>5, handles collinearity
 high_vif <- c('arrival_time_hour', 'arrival_seconds',
-              'pickup_type3', 'route_type11')
+              'pickup_type3', 'route_type11', 'sin_time', 'cos_time')
 
-high_vif <- c()
+drop_cols <- append(unimportant_features, high_vif)
+# high_vif <- c()
 
-train_data <- train_data %>%
-  select(-all_of(append(unimportant_features, high_vif)))
-
-test_data <- test_data %>%
-  select(-all_of(append(unimportant_features, high_vif)))
-
-plot_correlation_heatmap(train_data, threshold = 0.1)
+train_data <- drop_cols_report(train_data, drop_cols)
+test_data <- drop_cols_report(test_data, drop_cols)
 ```
 
-#### Linearity
-
-# Create individual plots
-  plot_list <- purrr::map(predictors_to_plot, ~ plot_box_dist(df, .x))
-  
-  # Combine plots
-  combined_plot <- patchwork::wrap_plots(plot_list, ncol = ncol) +
-
-```{r}
-### Linearity
-
-plot_scatterplot_line <- function(data, x, y = 'segment_time_s'){
-  ggplot(data, aes(x = .data[[x]], y = .data[[y]])) +
-    geom_point(alpha = 0.2) +
-    geom_smooth(method = "lm", color = "red", se = FALSE) +
-    geom_smooth(method = "loess", color = "blue", se = FALSE) +
-    theme_minimal()
-}
-
-sample_data <- train_data %>%
-  slice_sample(n = 5000)
-
-train_col_names <- colnames(sample_data)
-
-train_col_names <- train_col_names[!train_col_names %in% c('segment_time_s')]
-
-# length(train_col_names)
-
-# train_col_names <- train_col_names[30:]
-
-
-scatterplot_list <- map(train_col_names, ~plot_scatterplot_line(sample_data, .x))
-
-combined_plot <- patchwork::wrap_plots(scatterplot_list, ncol = 2)
-combined_plot
-                                   `
+```         
 ```
 
 #### Model Fit
 
+Based on the previous exploratory analysis, several predictors—most notably the interaction features (`distance_sin_interaction`, `distance_cos_interaction`) and spatial variables (`stop_lat`, `stop_lon`)—exhibited **clear non-linear relationships** with the target variable. In particular, the binned scatterplots revealed **curved and oscillatory patterns**, where the relationship could not be adequately captured by a simple linear trend.
+
+To address this, **second-degree polynomial transformations** were introduced for these predictors. The goal was to allow the model to capture **curvature in the relationship**, while still maintaining the simplicity and interpretability of a linear regression framework. Quadratic terms are often sufficient to approximate moderate non-linearities, such as U-shaped or inverted U-shaped patterns observed in the data.
+
+Importantly, the original (linear) versions of these predictors were replaced with their polynomial representations to avoid redundancy and reduce multicollinearity. The use of `poly(..., 2)` ensures that the resulting polynomial components are **orthogonal**, which stabilizes coefficient estimation and mitigates issues related to correlated predictors
+
 ```{r}
-# summary(train_data$seconds_since_midnight)
-# lm_model <- lm(segment_time_s ~ ., data = train_data)
 lm_poly <- lm(
   segment_time_s ~ 
-    segment_distance_m +
-    # distance_sin_interaction +
-    I(distance_sin_interaction^2) +
-    # distance_cos_interaction +
-    I(distance_cos_interaction^2) + .,
+    . -
+    distance_sin_interaction -
+    distance_cos_interaction -
+    stop_lat -
+    stop_lon +
+    poly(distance_sin_interaction, 2) +
+    poly(distance_cos_interaction, 2) +
+    poly(stop_lat, 2) +
+    poly(stop_lon, 2),
   data = train_data
 )
-summary(lm_poly)
+```
 
+#### Evaluating Predictors
+
+The polynomial regression model achieved an **R² of 0.505**, indicating that approximately **50.5% of the variance** in the target variable (*segment_time_s*) is explained by the selected predictors.
+
+We can see that the polynomial terms now have more significant compared to their linear alternatives. This confirms that these predictors matter, but not linearly.
+
+```{r}
+summary(lm_poly)
+```
+
+#### Variance Inflation Factor
+
+Most predictors show **very low multicollinearity**. The only standout is the *segment_distance_m*. We kept this predictor, however, because it has the strongest relationship with target and dropping it would cause the drop in R2 of about 5 percent.
+
+```{r}
 vif(lm_poly)
 ```
+
 #### Homoscedasticity
 
-```{r}
-plot(lm_model$fitted.values, lm_model$residuals)
-abline(h = 0, col = "red")
+Although some heteroscedasticity remains at the extremes, the inclusion of polynomial terms reduces systematic error and improves model fit, especially for larger target values.
 
-data.frame(
-  fitted = fitted(lm_model),
-  residuals = residuals(lm_model)
-) %>%
-  ggplot(aes(x = fitted, y = residuals)) +
-  geom_point(alpha = 0.2) +
-  geom_hline(yintercept = 0, color = "red") +
-  theme_minimal()
+```{r}
+
+# plot_homoscedasticity_plot(lm_poly$fitted.values, lm_poly$residuals)
+
+
+plot_scale_location(lm_poly$fitted.values, lm_poly$residuals)
 ```
+
 #### Evaluation
 
-```{r}
-predictions_lm <- predict(lm_poly, newdata = test_data)
-```
-
-##### Errors
+The polynomial regression model achieved an RMSE of 29.46 and MAE of 21.62, indicating that the average prediction error remains in the range of approximately 20–30 seconds. Compared to linear baselines, the model shows a notable improvement in explanatory power, reaching an R² of 0.489, which means that nearly 49% of the variance in segment travel time is captured. This improvement suggests that incorporating non-linear transformations allows the model to better represent underlying relationships in the data. However, the relatively moderate reduction in absolute error highlights the presence of inherent variability and noise in real-world transport data, which limits further gains in prediction accuracy within the linear modeling framework.
 
 ```{r}
-rmse <- sqrt(mean((test_data$segment_time_s - predictions_lm)^2))
-rmse
-```
+predictions_lm_poly <- predict(lm_poly, newdata = test_data)
 
-```{r}
-mae <- mean(abs(test_data$segment_time_s - predictions_lm))
-mae
-```
-
-```{r}
-ss_total <- sum((test_data$segment_time_s - mean(test_data$segment_time_s))^2)
-ss_res   <- sum((test_data$segment_time_s - predictions_lm)^2)
-r2_test <- 1 - (ss_res / ss_total)
-r2_test
-```
-
-##### Plots
-
-###### Predicted Vs. Actual
-
-```{r}
-
-plot_predicted_vs_actual <- function(data, predictions, target = 'segment_time_s'){
-
-ggplot(data.frame(actual = data[[target]], pred = predictions),
-       aes(x = actual, y = pred)) +
-  geom_point(alpha = 0.3) +
-  geom_abline(slope = 1, intercept = 0, color = "red") +
-  theme_minimal() +
-  ggtitle("Predicted vs Actual")
-}
-
-plot_predicted_vs_actual(test_data, predictions_lm)
-
-```
-
-
-###### Residuals vs. Predictors
-
-```{r}
-ggplot(data.frame(pred = predictions, residuals = test_data$segment_time_s - predictions),
-       aes(x = pred, y = residuals)) +
-  geom_point(alpha = 0.3) +
-  geom_hline(yintercept = 0, color = "red") +
-  theme_minimal() +
-  ggtitle("Residuals vs Predictions")
-```
-
-### Polynomial Regression
-
-#### Model Fit
-
-```{r}
-lm_poly <- lm(
-  segment_time_s ~ segment_distance_m + I(segment_distance_m^2) + .,
-  data = train_data
+results_lm_poly <- evaluate_regression(
+  actual = test_data$segment_time_s,
+  predicted = predictions_lm_poly,
+  model_name = "Polynomial Regression"
 )
 
-summary(lm_poly)
+results_lm_poly
+# predictions_lm <- round(predictions_lm / 15) * 15
 ```
 
-#### Evaluation
+#### Predicted vs. Actual
 
 ```{r}
-predictions_poly <- predict(lm_poly, newdata = test_data)
+plot_predicted_vs_actual(
+  data = test_data,
+  predictions = predictions_lm_poly,
+  target = "segment_time_s",
+  title = "Polynomial Regression: Predicted vs Actual"
+)
 ```
-
-##### Plots
-
-```{r}
-plot_predicted_vs_actual(test_data, predictions_poly)
-
-rmse <- sqrt(mean((test_data$segment_time_s - predictions_poly)^2))
-rmse
-```
-
