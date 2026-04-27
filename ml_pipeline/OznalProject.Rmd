@@ -28,7 +28,7 @@ The project is hypothesis-driven meaning a hypothesis will be evaluated at its e
 Based on the hypothesis and data structure we decided to go with these two scenarios:
 
 1.  (Scenario 1) Compare a regression or classification setup across three statistical or machine-learning methods and two feature-space partitioning approaches. Identify which features remain informative across both method families, discuss the implications for explainability, and outline the benefits each approach offers.
-2.  (Scenario 3) Extend your work by comparing algorithmic and embedded feature-selection methods for the same regression or classification task. This task may require some research on your side, as not all necessary information will be taught through the course. Report how many features you ultimately retain, and which features lose statistical significance as you add or remove predictors.
+2.  (Scenario 3) Extend your work by comparing one algorithmic (forward, backward, mixed selection) and two embedded feature‑selection methods (lasso, ridge, elastic net) for the same regression or classification task. This task may require some research on your side, as not all necessary information will be taught through the course. Report how many features you ultimately retain, and which features lose statistical significance as you add or remove predictors.
 
 ## Analyzing Data
 
@@ -91,6 +91,8 @@ library("patchwork")
 
 library("purrr")
 library("car")
+library("randomForest")
+library("ranger")
 ```
 
 ### Constants
@@ -1251,6 +1253,7 @@ select_model_features <- function(data, features = NULL, target = "segment_time_
 
 ```{r}
 timetable <- readRDS("./datasets/timetable_engineered.rds")
+# glimpse(timetable)library("ranger")
 ```
 
 ### Transformations
@@ -1285,6 +1288,8 @@ timetable_transformed <- add_engineered_features(timetable_transformed)
 
 plot_predictor_boxplots(timetable_transformed %>% select(problematic_features), target_col = 'segment_time_s')
 
+# glimpse(timetable_transformed)
+
 ```
 
 From the box plots above it is clear that the skewness has been successfully eliminated for all the problematic features.
@@ -1312,27 +1317,8 @@ train_col_names <- colnames(sample_data)
 
 train_col_names <- train_col_names[!train_col_names %in% c('segment_time_s')]
 
-# length(train_col_names)
 length(train_col_names)
 
-# train_col_names <- train_col_names[]
-
-# features_to_check <- c(
-#   "segment_distance_m",
-#   "distance_cos_interaction",
-#   "distance_sin_interaction",
-#   "time_since_last_stop",
-#   "stop_lat",
-#   "stop_lon"
-#   # "sin_time",
-#   # "cos_time",
-#   # "route_short_name_freq",
-#   # "trip_headsign_freq",
-#   # "stop_name_freq",
-#   # "route_r",
-#   # "route_g",
-#   # "route_b"
-# )
 features_to_check <- c(
   "segment_distance_m",
   "distance_cos_interaction",
@@ -1343,70 +1329,6 @@ features_to_check <- c(
   "stop_lat",
   "stop_lon"
 )
-
-# # --- ALTERNATIVE TO BINNED RELATIONSHIP PLOT ---
-# # plot_scatterplot_line <- function(data, x, y = "segment_time_s") {
-# #   ggplot(data, aes(x = .data[[x]], y = .data[[y]])) +
-# #     geom_point(alpha = 0.08, size = 0.6) +
-# #     geom_smooth(method = "lm", color = "red", se = FALSE, linewidth = 0.8) +
-# #     geom_smooth(
-# #       method = "gam",
-# #       formula = y ~ s(x, k = 5),
-# #       color = "blue",
-# #       se = FALSE,
-# #       linewidth = 0.9
-# #     ) +
-# #     theme_minimal() +
-# #     labs(
-# #       title = x,
-# #       x = x,
-# #       y = y
-# #     ) +
-# #     theme(
-# #       plot.title = element_text(size = 10, face = "bold"),
-# #       axis.text = element_text(size = 8),
-# #       axis.title = element_text(size = 8)
-# #     )
-# # }
-# # scatterplot_list <- purrr::map(
-# #   features_to_check,
-# #   ~ plot_scatterplot_line(sample_data, .x)
-# # )
-# # 
-# # combined_plot <- patchwork::wrap_plots(scatterplot_list, ncol = 2)
-# # 
-# # combined_plot
-# 
-# plot_binned_relationship <- function(data, x, y = "segment_time_s", bins = 30, 
-#                                      label_size = 12, text_size = 10) {
-#   data %>%
-#     mutate(bin = ntile(.data[[x]], bins)) %>%
-#     group_by(bin) %>%
-#     summarise(
-#       x_mean = mean(.data[[x]], na.rm = TRUE),
-#       y_mean = mean(.data[[y]], na.rm = TRUE),
-#       .groups = "drop"
-#     ) %>%
-#     ggplot(aes(x = x_mean, y = y_mean)) +
-#     geom_point(size = 1.2, alpha = 0.4) +
-#     geom_smooth(aes(color = "Linear"), method = "lm", se = FALSE) +
-#     geom_smooth(
-#       aes(color = "Non-linear"),
-#       method = "gam",
-#       formula = y ~ s(x, k = 5),
-#       se = FALSE
-#     ) +
-#     scale_color_manual(
-#       name = "Legend", # This name must be identical across all plots
-#       values = c("Linear" = "red", "Non-linear" = "blue")
-#     ) +
-#     theme_minimal() +
-#     theme(
-#       axis.title = element_text(size = label_size),
-#       axis.text = element_text(size = text_size)
-#     ) +
-#     labs(x = x, y = paste("Mean", y))
-# }
 
 # Note: Ensure TARGET is a string, e.g., TARGET <- "my_column_name"
 binned_plot_list <- purrr::map(
@@ -1435,6 +1357,8 @@ train_idx <- sample(seq_len(nrow(timetable_transformed)), size = 0.8 * nrow(time
 
 train_data <- timetable_transformed[train_idx, ]
 test_data  <- timetable_transformed[-train_idx, ]
+
+
 ```
 
 ### Keep-only Features (for testing)
@@ -1650,4 +1574,114 @@ plot_predicted_vs_actual(
   target = "segment_time_s",
   title = "Polynomial Regression: Predicted vs Actual"
 )
+```
+
+### Random Forest
+
+Random Forest was selected as an additional modeling approach due to its ability to capture complex non-linear relationships and interactions between predictors without requiring explicit feature engineering. Furthermore, Random Forest is robust to multicollinearity and less sensitive to outliers, while also providing an inherent measure of feature importance. These properties make it a strong candidate for comparison with simpler statistical models.
+
+#### Hyperparameter tuning
+
+To improve the performance of the Random Forest model, a simple hyperparameter tuning procedure was conducted focusing on the \`mtry\` parameter, which controls the number of predictors considered at each split. This parameter plays a crucial role in balancing model diversity and predictive strength. Two values were evaluated (mtry = 3 and mtry = 5), while keeping other parameters fixed.\
+\
+The results show a substantial improvement when increasing \`mtry\` from 3 to 5. Specifically, the model with mtry = 3 achieved an R² of 0.839, whereas mtry = 5 significantly improved performance to an R² of 0.922, accompanied by a notable reduction in both RMSE and MAE. This indicates that allowing the model to consider more predictors at each split enables it to better capture relevant patterns in the data.
+
+```{r}
+results <- list()
+
+for (m in c(3, 5)) {
+  model <- randomForest(
+    segment_time_s ~ .,
+    data = train_data,
+    ntree = 200,
+    mtry = m,
+    nodesize = 10
+  )
+  
+  preds <- predict(model, test_data)
+  
+  res <- evaluate_regression(
+    actual = test_data$segment_time_s,
+    predicted = preds,
+    model_name = paste("RF mtry =", m)
+  )
+  
+  results[[as.character(m)]] <- res
+}
+
+dplyr::bind_rows(results)
+```
+
+#### Model Fit
+
+The Random Forest model was implemented using the `ranger` package, which offers a more computationally efficient alternative to the standard implementation. The model was trained using 100 trees (`num.trees = 100`), providing a balance between predictive performance and training time. The `mtry` parameter was set to 5 based on prior tuning results.
+
+To control model complexity and reduce overfitting, the minimum node size was set to 10 (`min.node.size = 10`), ensuring that splits are only performed when sufficient data is available. Feature importance was computed using the impurity-based measure (`importance = "impurity"`), enabling identification of the most influential predictors.
+
+Overall, this configuration reflects a compromise between efficiency and predictive accuracy, leveraging the strengths of Random Forest while maintaining reasonable computational cost.
+
+```{r}
+rf_best <- ranger(
+  segment_time_s ~ .,
+  data = train_data2,
+  num.trees = 100,
+  mtry = 5,
+  min.node.size = 10,
+  importance = "impurity",
+  seed = 42
+)
+
+```
+
+#### Evaluation
+
+The Random Forest model was evaluated on both training and test datasets to assess its predictive performance and potential overfitting. On the training data, the model achieved an RMSE of 7.71 and an R² of 0.965, indicating an excellent fit and strong ability to capture patterns in the data. However, such high performance on training data may also suggest a tendency to overfit.\
+To verify generalization, the model was evaluated on unseen test data, where it achieved an RMSE of 12.13 and an R² of 0.913. Although there is a noticeable decrease in performance compared to the training results, the model still maintains high predictive accuracy. This gap between training and test performance indicates a moderate level of overfitting, which is expected for flexible models such as Random Forest, but does not significantly impair its ability to generalize.
+
+```{r}
+pred_train_rf <- predict(rf_best, data = train_data)$predictions
+pred_test_rf  <- predict(rf_best, data = test_data)$predictions
+
+results_rf <- dplyr::bind_rows(
+  evaluate_regression(
+    actual = train_data$segment_time_s,
+    predicted = pred_train_rf,
+    model_name = "Random Forest train"
+  ),
+  evaluate_regression(
+    actual = test_data$segment_time_s,
+    predicted = pred_test_rf,
+    model_name = "Random Forest test"
+  )
+)
+
+results_rf
+```
+
+#### Feature Importance
+
+The feature importance analysis derived from the Random Forest model highlights **segment_distance_m** as the most influential predictor by a substantial margin, indicating that travel time is primarily driven by the physical distance between stops. This is consistent with domain expectations. Among the remaining predictors, spatial features such as **stop_lon** and **stop_lat** also exhibit strong importance, suggesting that location-specific factors contribute significantly to travel time variability. Engineered interaction features (**distance_sin_interaction** and **distance_cos_interaction**) rank highly as well, confirming that incorporating temporal patterns into distance-based measures enhances predictive power. Additionally, frequency-encoded categorical variables, including **stop_name_freq**, **route_short_name_freq**, and **trip_headsign_freq**, provide meaningful signal, likely capturing route-specific and operational characteristics.
+
+```{r}
+importance <- rf_best$variable.importance
+
+importance_df <- data.frame(
+  feature = names(importance),
+  importance = importance
+) %>%
+  dplyr::arrange(desc(importance))
+
+importance_df
+
+importance_df %>%
+  head(15) %>%
+  ggplot(aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Feature Importance (Random Forest - ranger)",
+    x = "Feature",
+    y = "Importance"
+  )
 ```
