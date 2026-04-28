@@ -592,18 +592,18 @@ timetable_encoded <- timetable_imputed %>%
   one_hot_encode("pickup_type") %>%
   one_hot_encode("route_type") %>%
   hex_to_rgb_df("route_color", prefix = "route") %>%
-  frequency_encode("route_short_name") %>%
-  frequency_encode("route_id") %>%
-  frequency_encode("trip_headsign") %>%
-  frequency_encode("stop_name") %>%
-  frequency_encode("stop_code") %>%
+  # frequency_encode("route_short_name") %>%
+  # frequency_encode("route_id") %>%
+  # frequency_encode("trip_headsign") %>%
+  # frequency_encode("stop_name") %>%
+  # frequency_encode("stop_code") %>%
   select(
     -route_color,
-    -route_short_name,
-    -route_id,
-    -trip_headsign,
-    -stop_name,
-    -stop_code
+    # -route_short_name,
+    # -route_id,
+    # -trip_headsign,
+    # -stop_name,
+    # -stop_code
   )
 
 dup_cols_2 <- find_duplicate_columns(timetable_encoded)
@@ -1261,13 +1261,50 @@ select_model_features <- function(data, features = NULL, target = "segment_time_
     dplyr::select(dplyr::any_of(keep_cols))
 }
 
+# ---- ENCODING ----- #
+
+fit_frequency_encoding <- function(train_df, col) {
+  freq_col <- paste0(col, "_freq")
+  
+  freq_table <- train_df %>%
+    dplyr::count(.data[[col]])
+  
+  names(freq_table)[names(freq_table) == "n"] <- freq_col
+  
+  freq_table[[freq_col]] <- freq_table[[freq_col]] / nrow(train_df)
+  
+  freq_table
+}
+
+apply_frequency_encoding <- function(df, freq_table, col) {
+  freq_col <- paste0(col, "_freq")
+  
+  df %>%
+    dplyr::left_join(freq_table, by = col) %>%
+    dplyr::mutate(
+      !!freq_col := ifelse(is.na(.data[[freq_col]]), 0, .data[[freq_col]])
+    ) %>%
+    dplyr::select(-dplyr::all_of(col))
+}
+
 ```
 
 ### Loading Data
 
+The predictor `time_since_last_stop` was removed prior to model training, as it may introduce data leakage by incorporating temporal information that is not available at prediction time. However, this feature was retained during the exploratory data analysis phase, where it was frequently used for understanding relationships within the data. To avoid disrupting the consistency and completeness of the EDA process, the feature was only excluded at the modeling stage, ensuring both valid analysis and reliable model evaluation.
+
 ```{r}
 timetable <- readRDS("./datasets/timetable_engineered.rds")
 # glimpse(timetable)library("ranger")
+
+glimpse(timetable)
+
+features_to_drop <- c('time_since_last_stop')
+
+timetable <- drop_cols_report(timetable, features_to_drop)
+
+
+
 ```
 
 ### Transformations
@@ -1395,6 +1432,29 @@ glimpse(train_data)
 
 ```
 
+### Frequency Encoding
+
+```{r}
+freq_cols <- c(
+  "route_short_name",
+  "route_id",
+  "trip_headsign",
+  "stop_name",
+  "stop_code"
+)
+
+glimpse(train_data)
+
+for (col in freq_cols) {
+  freq_table <- fit_frequency_encoding(train_data, col)
+  
+  train_data <- apply_frequency_encoding(train_data, freq_table, col)
+  test_data  <- apply_frequency_encoding(test_data, freq_table, col)
+}
+
+train_data$route_short_name_freq
+```
+
 ### Keep-only Features (for testing)
 
 ```{r}
@@ -1460,6 +1520,8 @@ lm_model <- step(
 
 summary(lm_model)
 ```
+
+#### Train Data Evaluation
 
 ```{r}
 predictions_lm <- predict(lm_model, newdata = train_data)
@@ -1835,30 +1897,79 @@ To improve the performance of the Random Forest model, a simple hyperparameter t
 \
 The results show a substantial improvement when increasing \`mtry\` from 3 to 5. Specifically, the model with mtry = 3 achieved an R² of 0.839, whereas mtry = 5 significantly improved performance to an R² of 0.922, accompanied by a notable reduction in both RMSE and MAE. This indicates that allowing the model to consider more predictors at each split enables it to better capture relevant patterns in the data.
 
+##### Validation Dataset
+
 ```{r}
+set.seed(42)
+
+val_ids <- sample(seq_len(nrow(train_data)), size = 0.2 * nrow(train_data))
+
+validation_data <- train_data[val_ids, ]
+train_inner <- train_data[-val_ids, ]
+```
+
+```{r}
+# results <- list()
+# 
+# for (m in c(3, 5)) {
+#   model <- randomForest(
+#     segment_time_s ~ .,
+#     data = train_data,
+#     ntree = 200,
+#     mtry = m,
+#     nodesize = 10
+#   )
+#   
+#   preds <- predict(model, test_data)
+#   
+#   res <- evaluate_regression(
+#     actual = test_data$segment_time_s,
+#     predicted = preds,
+#     model_name = paste("RF mtry =", m)
+#   )
+#   
+#   results[[as.character(m)]] <- res
+# }
+# 
+# dplyr::bind_rows(results)
 results <- list()
+models <- list()
 
 for (m in c(3, 5)) {
-  model <- randomForest(
+  model <- ranger(
     segment_time_s ~ .,
-    data = train_data,
-    ntree = 200,
+    data = train_inner,
+    num.trees = 200,
     mtry = m,
-    nodesize = 10
+    min.node.size = 10,
+    seed = 42
   )
   
-  preds <- predict(model, test_data)
+  preds <- predict(model, data = validation_data)$predictions
   
   res <- evaluate_regression(
-    actual = test_data$segment_time_s,
+    actual = validation_data$segment_time_s,
     predicted = preds,
-    model_name = paste("RF mtry =", m)
+    model_name = paste("RF validation mtry =", m)
   )
   
   results[[as.character(m)]] <- res
+  models[[as.character(m)]] <- model
 }
 
-dplyr::bind_rows(results)
+validation_results <- dplyr::bind_rows(results)
+validation_results
+```
+
+##### Choosing Best Params
+
+```{r}
+best_mtry <- validation_results %>%
+  dplyr::arrange(RMSE) %>%
+  dplyr::slice(1) %>%
+  dplyr::pull(model)
+
+best_mtry
 ```
 
 #### Model Fit
@@ -1872,7 +1983,7 @@ Overall, this configuration reflects a compromise between efficiency and predict
 ```{r}
 rf_best <- ranger(
   segment_time_s ~ .,
-  data = train_data2,
+  data = train_data,
   num.trees = 100,
   mtry = 5,
   min.node.size = 10,
