@@ -118,10 +118,22 @@ timetable <- read_csv("../data/interim/dataset.csv")
 
 table(timetable$day_type)
 
+set.seed(42)
+
+# Stratified group sample: 10% trip_id v rámci kazdeho day_type
+sampled_trips <- timetable %>%
+  distinct(trip_id, day_type) %>%
+  group_by(day_type) %>%
+  slice_sample(prop = 0.1) %>%
+  ungroup() %>%
+  pull(trip_id)
+
+# Vyfiltruj vsetky riadky patriace tym tripom
 timetable <- timetable %>%
-  group_by(day_type) %>%  # important variable
-  sample_frac(0.1) %>%   # 10% sample
-  ungroup()
+  filter(trip_id %in% sampled_trips)
+
+# Sanity check - proporcie day_type by mali byt zachovane
+table(timetable$day_type)
 ```
 
 Now we can take a lot at the dataset to see its structure and info about its columns.
@@ -483,10 +495,9 @@ table(timetable_reduced$arrival_time_second)
 # these were used during extraction process and were broken into several predictors
 # ===
 
-
 highly_correlated_char = c('arrival_time', 'service_id', 'shape_id', 'stop_id',
                            'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
-                           'saturday', 'sunday', 'trip_id', 'stop_sequence')
+                           'saturday', 'sunday', 'stop_sequence')
 timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated_char)
 
 # ===
@@ -1355,11 +1366,29 @@ Several predictors—especially interaction terms—demonstrate clear non-linear
 
 set.seed(42)
 
-# 80/20 split
-train_idx <- sample(seq_len(nrow(timetable_transformed)), size = 0.8 * nrow(timetable))
+# 1. Vyber 80% trip_id (nie riadkov)
+unique_trips <- unique(timetable_transformed$trip_id)
+train_trips <- sample(unique_trips, size = 0.8 * length(unique_trips))
 
-train_data <- timetable_transformed[train_idx, ]
-test_data  <- timetable_transformed[-train_idx, ]
+# 2. Filter podla trip_id - cely trip ide bud do trainu, alebo do testu
+train_data <- timetable_transformed %>%
+  filter(trip_id %in% train_trips)
+
+test_data <- timetable_transformed %>%
+  filter(!trip_id %in% train_trips)
+
+# 3. Sanity check - ziadny trip nesmie byt v oboch
+shared_trips <- intersect(unique(train_data$trip_id), unique(test_data$trip_id))
+stopifnot(length(shared_trips) == 0)
+
+cat("Train trips:", length(unique(train_data$trip_id)), 
+    "| Test trips:", length(unique(test_data$trip_id)), "\n")
+cat("Train rows:", nrow(train_data), 
+    "| Test rows:", nrow(test_data), "\n")
+
+# 4. Az teraz dropnut trip_id - v modeli ho nechces
+train_data <- train_data %>% select(-trip_id)
+test_data  <- test_data  %>% select(-trip_id)
 
 glimpse(train_data)
 
