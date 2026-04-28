@@ -1561,6 +1561,7 @@ We can see that the polynomial terms now have more significant compared to their
 
 ```{r}
 summary(lm_poly)
+length(coef(lm_poly)) - 1
 ```
 
 #### Training Data Evaluation
@@ -1636,7 +1637,7 @@ Prior to training the Lasso model, the dataset was transformed into a suitable f
 
 ```{r}
 feature_names <- setdiff(names(train_data), TARGET)
-feature_names
+# feature_names
 
 x_train <- as.matrix(train_data[, feature_names])
 y_train <- train_data[[TARGET]]
@@ -1686,6 +1687,8 @@ coef_lasso
 
 #### Selected Features
 
+Here we can list the remaining predictors that has not been dropped by lasso model.
+
 ```{r}
 
 selected_features <- rownames(coef_lasso)[coef_lasso[,1] != 0]
@@ -1697,6 +1700,8 @@ selected_features
 ```
 
 #### Evaluation
+
+Lasso regression achieved performance comparable to linear regression with backward elimination, with slightly higher RMSE and lower R² on both training and testing sets. While it did not outperform the linear models in predictive accuracy, Lasso provided the advantage of automatic feature selection by shrinking several coefficients to zero, resulting in a simpler and more interpretable model.
 
 ```{r}
 
@@ -1717,6 +1722,78 @@ results_lasso <- dplyr::bind_rows(
 )
 
 results_lasso
+```
+
+### Elastic Net
+
+Elastic Net regression was applied as a second embedded feature selection method. It combines the L1 penalty of Lasso, which can shrink coefficients to zero, with the L2 penalty of Ridge, which stabilizes coefficient estimates in the presence of correlated predictors. This makes Elastic Net suitable for this dataset, where several time-related and route-related variables may be correlated. The value `alpha = 0.5` was used to balance both penalties, and `lambda.1se` was selected to obtain a simpler model with stronger regularization.
+
+#### Model Fit
+
+```{r}
+
+# Elastic Net: alpha between 0 and 1
+set.seed(42)
+
+cv_elastic <- cv.glmnet(
+  x_train,
+  y_train,
+  alpha = 0.5,
+  nfolds = 5
+)
+
+# best_lambda_elastic_1se <- cv_elastic$lambda.1se
+best_lambda_elastic_1se <- cv_elastic$lambda.1se
+best_lambda_elastic_1se
+
+```
+
+#### Retraining Model
+
+```{r}
+elastic_model <- glmnet(
+  x_train,
+  y_train,
+  alpha = 0.5,
+  lambda = best_lambda_elastic_1se
+)
+
+coef_elastic <- coef(elastic_model)
+coef_elastic
+```
+
+#### Selected Features
+
+```{r}
+selected_features_elastic <- rownames(coef_elastic)[coef_elastic[, 1] != 0]
+selected_features_elastic <- selected_features_elastic[
+  selected_features_elastic != "(Intercept)"
+]
+
+selected_features_elastic
+length(selected_features_elastic)
+```
+
+```{r}
+
+pred_train_elastic <- predict(elastic_model, newx = x_train)
+pred_test_elastic  <- predict(elastic_model, newx = x_test)
+
+results_elastic <- dplyr::bind_rows(
+  evaluate_regression(
+    actual = y_train,
+    predicted = pred_train_elastic,
+    model_name = "Elastic Net train"
+  ),
+  evaluate_regression(
+    actual = y_test,
+    predicted = pred_test_elastic,
+    model_name = "Elastic Net test"
+  )
+)
+
+results_elastic
+
 ```
 
 ### Random Forest
