@@ -93,6 +93,9 @@ library("purrr")
 library("car")
 library("randomForest")
 library("ranger")
+library("glmnet") # for lasso regression
+
+# install.packages("glmnet")
 ```
 
 ### Constants
@@ -1358,6 +1361,8 @@ train_idx <- sample(seq_len(nrow(timetable_transformed)), size = 0.8 * nrow(time
 train_data <- timetable_transformed[train_idx, ]
 test_data  <- timetable_transformed[-train_idx, ]
 
+glimpse(train_data)
+
 
 ```
 
@@ -1370,49 +1375,73 @@ train_data <- select_model_features(train_data, features_distance)
 test_data  <- select_model_features(test_data, features_distance)
 ```
 
+### Backward Elimination
+
+Backward elimination was selected as the primary feature selection method due to its ability to evaluate predictors in the context of the full model. Starting with all available features ensures that interactions and combined effects between variables are considered, which is particularly important in complex datasets where individual predictors may only be informative when used together. The method iteratively removes variables based on the Akaike Information Criterion (AIC), balancing model fit and complexity, and thus helping to prevent overfitting while maintaining predictive performance.
+
+However, backward elimination does not explicitly address multicollinearity, which can lead to unstable coefficient estimates in regression models. Therefore, an additional feature selection step based on the Variance Inflation Factor (VIF) is applied for linear and polynomial regression models. This allows the removal of highly collinear predictors, improving model interpretability and stability.
+
 ### Linear Regression
 
-#### Feature Selection
+#### Correlated Features
 
-Since polynomial regression does not inherently perform feature selection or regularization, an **iterative, model-driven approach** was adopted. The process began with a relatively rich set of predictors, including engineered and interaction features. The model was then repeatedly refined through successive training and evaluation cycles.
+The features listed in `high_vif_features` were identified through an iterative process. First, a regression model was fitted using backward elimination based on the AIC criterion. Subsequently, the Variance Inflation Factor (VIF) was computed to assess multicollinearity among the remaining predictors. Features exhibiting high VIF values were then removed, and the model was refitted. This process was repeated until an acceptable level of multicollinearity was achieved.
 
-After each iteration, the statistical significance of predictors was assessed using the **t-values and corresponding p-values** obtained from the fitted model. Predictors with low statistical significance (i.e., high p-values) were considered uninformative and gradually removed from the feature set.
-
-However, statistical significance alone can be misleading in the presence of **multicollinearity**, which inflates standard errors and destabilizes coefficient estimates. Therefore, the **Variance Inflation Factor (VIF)** was used as a complementary diagnostic tool. Predictors exhibiting high multicollinearity (VIF \> 5) were systematically eliminated to improve model stability and interpretability.
+You can skip this if you wish to keep the correlated features and use only pure backward elimination approach.
 
 ```{r}
-unimportant_features <- c('seconds_since_midnight',
-                          'stop_lat',
-                          'arrival_time_second',
-                          'platform_codeH',
-                          'platform_codeJ',
-                          'trip_headsign_freq',
-                          'direction_id1',
-                          'arrival_time_minute',
-                          'platform_codeB',
-                          'platform_codeC')
-high_vif_features <- c('sin_time', 'cos_time', 'route_type11', 'day_typesunday',
-                       'arrival_time_hour', 'arrival_seconds')
-drop_features <- append(unimportant_features, high_vif_features)
+# unimportant_features <- c('seconds_since_midnight',
+#                           'stop_lat',
+#                           'arrival_time_second',
+#                           'platform_codeH',
+#                           'platform_codeJ',
+#                           'trip_headsign_freq',
+#                           'direction_id1',
+#                           'arrival_time_minute',
+#                           'platform_codeB',
+#                           'platform_codeC')
+# unimportant_features <- c()
+# high_vif_features <- c('sin_time', 'cos_time', 'route_type11', 'day_typesunday',
+#                        'arrival_time_hour', 'arrival_seconds')
+# drop_features <- append(unimportant_features, high_vif_features)
 
 
-train_data <- drop_cols_report(train_data, drop_features)
-test_data <- drop_cols_report(test_data, drop_features)
+high_vif_features <- c('sin_time', 'cos_time', 'route_type11',
+'day_typesunday', 'arrival_time_hour', 'arrival_seconds')
+
+
+train_data <- drop_cols_report(train_data, high_vif_features)
+test_data <- drop_cols_report(test_data, high_vif_features)
 
 ```
 
-#### Model Fit & Evaluation
-
-The linear regression model achieved a **Multiple R² of 0.4155**, indicating that approximately **41.5% of the variance** in the target variable (*segment_time_s*) is explained by the selected predictors.
-
-Although most predictors are statistically significant, the overall performance indicates that the model is **unable to fully capture non-linear relationships** present in the data.
-
-These observations suggest that while the selected features carry meaningful signal, their relationships with the target variable are **not strictly linear**, and thus cannot be adequately modeled using a simple linear framework.
+#### Model Fit & Feature Selection
 
 ```{r}
 
+# lm_model <- lm(segment_time_s ~ ., data = train_data)
+# summary(lm_model)
 lm_model <- lm(segment_time_s ~ ., data = train_data)
+
+lm_model <- step(
+  lm_model,
+  direction = "backward",
+  trace = TRUE
+)
+
 summary(lm_model)
+```
+
+```{r}
+predictions_lm <- predict(lm_model, newdata = train_data)
+
+results_lm <- evaluate_regression(
+  actual = train_data$segment_time_s,
+  predicted = predictions_lm,
+  model_name = "Linear Regression"
+)
+
+results_lm
 ```
 
 #### VIF
@@ -1472,23 +1501,27 @@ After each iteration, the statistical significance of predictors was assessed us
 However, statistical significance alone can be misleading in the presence of **multicollinearity**, which inflates standard errors and destabilizes coefficient estimates. Therefore, the **Variance Inflation Factor (VIF)** was used as a complementary diagnostic tool. Predictors exhibiting high multicollinearity (VIF \> 5) were systematically eliminated to improve model stability and interpretability.
 
 ```{r}
-unimportant_features <- c('seconds_since_midnight', 'platform_codeD',
-                          'platform_codeG', 'day_typesaturday', 'day_typesunday',
-                          'platform_codeF',
-                          'platform_codeB', 'platform_codeC',
-                          'direction_id1', 'platform_codeJ', 'platform_codeI', 'route_type11',
-                          'arrival_seconds', 'arrival_time_hour',
-                          'route_short_name_freq', 'arrival_time_minute')
+# unimportant_features <- c('seconds_since_midnight', 'platform_codeD',
+#                           'platform_codeG', 'day_typesaturday', 'day_typesunday',
+#                           'platform_codeF',
+#                           'platform_codeB', 'platform_codeC',
+#                           'direction_id1', 'platform_codeJ', 'platform_codeI', 'route_type11',
+#                           'arrival_seconds', 'arrival_time_hour',
+#                           'route_short_name_freq', 'arrival_time_minute')
 
 # vif>5, handles collinearity
+# high_vif <- c('arrival_time_hour', 'arrival_seconds',
+#               'pickup_type3', 'route_type11', 'sin_time', 'cos_time')
+# 
+# drop_cols <- append(unimportant_features, high_vif)
+# # high_vif <- c()
+
 high_vif <- c('arrival_time_hour', 'arrival_seconds',
-              'pickup_type3', 'route_type11', 'sin_time', 'cos_time')
+              'pickup_type3', 'route_type11', 'sin_time', 'cos_time',
+              'day_typeweekday')
 
-drop_cols <- append(unimportant_features, high_vif)
-# high_vif <- c()
-
-train_data <- drop_cols_report(train_data, drop_cols)
-test_data <- drop_cols_report(test_data, drop_cols)
+train_data <- drop_cols_report(train_data, high_vif)
+test_data <- drop_cols_report(test_data, high_vif)
 ```
 
 ```         
@@ -1516,6 +1549,8 @@ lm_poly <- lm(
     poly(stop_lon, 2),
   data = train_data
 )
+
+lm_poly <- step(lm_poly, direction = "backward")
 ```
 
 #### Evaluating Predictors
@@ -1526,6 +1561,21 @@ We can see that the polynomial terms now have more significant compared to their
 
 ```{r}
 summary(lm_poly)
+```
+
+#### Training Data Evaluation
+
+```{r}
+predictions_lm_poly <- predict(lm_poly, newdata = train_data)
+
+
+results_lm_poly <- evaluate_regression(
+  actual = train_data$segment_time_s,
+  predicted = predictions_lm_poly,
+  model_name = "Polynomial Regression"
+)
+
+results_lm_poly
 ```
 
 #### Variance Inflation Factor
@@ -1574,6 +1624,99 @@ plot_predicted_vs_actual(
   target = "segment_time_s",
   title = "Polynomial Regression: Predicted vs Actual"
 )
+```
+
+### Lasso Regression
+
+Lasso regression was selected as an embedded feature selection method due to its ability to simultaneously perform model fitting and variable selection. By introducing an L1 regularization penalty, Lasso shrinks regression coefficients and forces some of them to become exactly zero, effectively removing less important predictors from the model. This is particularly useful in datasets with a large number of features or potential multicollinearity, as it produces a more compact and interpretable model while helping to prevent overfitting.
+
+#### Model Fit
+
+Prior to training the Lasso model, the dataset was transformed into a suitable format required by the glmnet package. Subsequently, 5-fold cross-validation was applied to determine the optimal regularization parameter (λ), enabling a balance between model complexity and predictive performance.
+
+```{r}
+feature_names <- setdiff(names(train_data), TARGET)
+feature_names
+
+x_train <- as.matrix(train_data[, feature_names])
+y_train <- train_data[[TARGET]]
+
+x_test <- as.matrix(test_data[, feature_names])
+y_test <- test_data[[TARGET]]
+
+
+cv_lasso <- cv.glmnet(
+  x_train,
+  y_train,
+  alpha = 1,        # LASSO
+  nfolds = 5 # splitting into training data into 5 parts
+)
+```
+
+#### Retraining Model
+
+The optimal regularization parameter (λ) was selected using the `lambda.1se` criterion obtained from cross-validation. Unlike `lambda.min`, which yields the lowest prediction error, `lambda.1se` corresponds to the largest value of λ within one standard error of the minimum error. This results in a simpler and more regularized model, often with fewer retained features and improved generalization. Using this value, the final Lasso model was trained, allowing stronger penalization of coefficients and promoting sparsity in the resulting feature set.
+
+```{r}
+# lambda controls how strongly coefficients are penalized:
+# small lambda → weaker penalty → more features retained
+# large lambda → stronger penalty → more coefficients shrink to zero
+# lambda.min is the value that gives the lowest cross-validation error.
+best_lambda_1se <- cv_lasso$lambda.1se
+best_lambda_1se
+
+# This fits the final Lasso model using the selected best lambda.
+lasso_model <- glmnet(
+  x_train,
+  y_train,
+  alpha = 1,
+  lambda = best_lambda_1se
+)
+```
+
+#### Model Coefficients
+
+The coefficients of the Lasso model show that several predictors were shrunk exactly to zero (denoted by “.”), indicating that they were removed from the model. This demonstrates the inherent feature selection capability of Lasso regression. Only a subset of variables retained non-zero coefficients, forming a more compact model while preserving the most informative predictors.
+
+```{r}
+
+coef_lasso <- coef(lasso_model)
+coef_lasso
+```
+
+#### Selected Features
+
+```{r}
+
+selected_features <- rownames(coef_lasso)[coef_lasso[,1] != 0]
+selected_features
+
+selected_features <- selected_features[selected_features != "(Intercept)"]
+
+selected_features
+```
+
+#### Evaluation
+
+```{r}
+
+pred_train_lasso <- predict(lasso_model, newx = x_train)
+pred_test_lasso  <- predict(lasso_model, newx = x_test)
+
+results_lasso <- dplyr::bind_rows(
+  evaluate_regression(
+    actual = y_train,
+    predicted = pred_train_lasso,
+    model_name = "Lasso train"
+  ),
+  evaluate_regression(
+    actual = y_test,
+    predicted = pred_test_lasso,
+    model_name = "Lasso test"
+  )
+)
+
+results_lasso
 ```
 
 ### Random Forest
