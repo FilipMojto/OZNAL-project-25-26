@@ -7,21 +7,17 @@ output: html_document
 
 ## Selecting Data
 
-For the project we selected a publicly available local open dataset available here:
+For this project, a publicly available open dataset provided by the City of Bratislava was utilized, accessible at
 
 <https://data.bratislava.sk/datasets/aba12fd2cbac4843bc7406151bc66106/about>
 
-This dataset contains raw data collected by MHD Bratislava which are stored in the form of multiple text files connected by foreign keys (similar to relational databases).
-
-The newest data update our project use was released at:
-
-April 17, 2026
+The dataset comprises raw data collected by the municipal public transport operator (MHD Bratislava) and is distributed across multiple text files. These files are interconnected through foreign key relationships, forming a structure analogous to a relational database. The version of the dataset employed in this study corresponds to the most recent update available at the time of analysis, released on April 17, 2026.
 
 ## Defining Hypothesis
 
 The project is hypothesis-driven meaning a hypothesis will be evaluated at its end. The hypothesis is stated as follows:
 
-*"We hypothesize that scheduled travel time between two stops in GTFS systems can be predicted from such metrics like euclidean distance, route & stop attributes, geographical metrics like Lon and Lat points, temporal features like arrival times and other metrics."*
+*We hypothesize that scheduled travel time between two stops in GTFS-based public transport systems can be accurately predicted using a high-dimensional set of features (\>30 predictors), including spatial (e.g., Euclidean distance, geographic coordinates), temporal (e.g., arrival time, time-of-day transformations), route-specific, and stop-specific attributes. Furthermore, we hypothesize that incorporating engineered and encoded features (such as frequency-encoded categorical variables and interaction terms) will significantly improve predictive performance compared to using only basic spatial features.*
 
 ## Selecting Scenarios
 
@@ -32,17 +28,15 @@ Based on the hypothesis and data structure we decided to go with these two scena
 
 ## Analyzing Data
 
-As we mentioned earlier, the we data represent GTFS system of MHD Bratislava which is stored in several .txt files such as:
+As introduced earlier, the dataset represents a General Transit Feed Specification (GTFS) system of public transportation operated by MHD Bratislava. The data are distributed across multiple text files, each capturing a different aspect of the transport system. The most relevant files used in this analysis include:
 
-1.  *stops.txt* (attributes about stops located in Bratislava like Hlavná stanica, Pod stanicou, etc.)
-2.  *trips.txt* (a concrete trip taken by concrete vehicle following concrete stops and of conrete route)
-3.  *stop_times.txt* (attributes about stop times of concrete trip at concrete stop)
-4.  routes.txt (attributes about routes such as route_type managed by MHD)
-5.  and other files
+1.  *stops.txt* — contains attributes describing individual stops (e.g., Hlavná stanica, Pod stanicou), including their geographic coordinates.
+2.  *trips.txt* — represents individual trips performed by vehicles, linking routes with sequences of stops.
+3.  *stop_times.txt* — provides detailed timing information for each stop within a given trip.
+4.  *routes.txt* — contains metadata about routes, such as route type and identifiers.
+5.  Additional auxiliary files provided within the GTFS structure.
 
-Many of the files or columns are highly sparse and are not provided by MHD (e.g. *frequencies.txt*, *pathways.txt* or columns *bike_allowed*, *stop_headsign* or *shape_dist_traveled).*
-
-When analyzing the dimensions of data it has almost **700k rows** and almost **70** which should be more than satisfactory for training simple regression models like *Linear Regression* or even more complex tree-based models like *Random Forests*.
+Several files and attributes are either sparsely populated or not utilized in this study due to missing or incomplete data. Examples include files such as *frequencies.txt* and *pathways.txt*, as well as attributes like *bike_allowed*, *stop_headsign*, and *shape_dist_traveled*. These were excluded to ensure data quality and consistency during modelling.
 
 ### Target - Regression or Classification?
 
@@ -58,21 +52,9 @@ The hypothesis states that we are predicting travel time which looks like a typi
 
 - 540 - 2 observations
 
-Although the target takes **discrete values** (mostly multiples of 15 or 60 seconds), it represents an underlying **continuous physical quantity — travel time**. Therefore:
+Although the target variable assumes discrete values (primarily multiples of 15 seconds) it represents an underlying continuous physical quantity, namely travel time. The variable is numeric and ordered, and differences between values are meaningful (e.g., 60 vs. 120 seconds). The observed discretization is a consequence of measurement precision or timetable rounding, rather than an inherent property of the phenomenon itself.
 
-- The variable is **ordered and numeric**, not categorical
-
-- Differences between values are meaningful (e.g., 60 vs 120 seconds)
-
-- Discretization arises from **measurement or schedule rounding**, not from the nature of the phenomenon
-
-As a result, **regression models are appropriate**, since they:
-
-- preserve the **ordinal structure and magnitude differences**
-
-- allow modeling of **continuous relationships** between predictors and travel time
-
-- avoid loss of information that would occur if the problem were treated as classification
+Given this, a regression-based approach is more appropriate than classification. Regression models preserve both the ordinal structure and magnitude of the target variable, enabling the modelling of continuous relationships between predictors and travel time. In contrast, treating the problem as classification would lead to a loss of information and reduced interpretability.
 
 ```         
 ```
@@ -80,6 +62,10 @@ As a result, **regression models are appropriate**, since they:
 ## Experimental Setup
 
 ### Libraries
+
+The analysis was conducted using the R programming language, with several libraries supporting data manipulation, visualization, and modelling. The *tidyverse* collection, including packages such as *dplyr*, *readr*, *ggplot2*, and *purrr*, was primarily used for data preprocessing, transformation, and visualization. The *patchwork* package was employed to combine multiple plots into unified visual outputs.
+
+For statistical modelling and machine learning, multiple specialized libraries were utilized. Linear and diagnostic analyses were supported by the *car* package, while tree-based models were implemented using *rpart* (decision trees) and *ranger* (efficient random forest implementation). Regularized regression methods, including Lasso and Elastic Net, were implemented using the *glmnet* package
 
 ```{r}
 library("tidyverse")
@@ -91,23 +77,22 @@ library("patchwork")
 
 library("purrr")
 library("car")
-library("randomForest") # faster rf fit
 library("rpart") # decision tree
 library("ranger")
 library("glmnet") # for lasso regression
 library("rsample") # for cv
-
-# install.packages("glmnet")
 ```
 
 ### Constants
+
+The following constants are defined to ensure consistency and reproducibility across the project. The variable *TARGET* specifies the response variable to be predicted, while *SEED* is used to control randomness in operations such as data splitting and model training. The constant *CV_N_FOLDS* determines the number of folds used in cross-validation, enabling a robust evaluation of model performance.
 
 ```{r}
 
 TARGET <- 'segment_time_s'
 SEED <- 42
 CV_N_FOLDS <- 5
-
+SLICE_SAMPLE = 0.1
 ```
 
 ## EDA
@@ -117,71 +102,67 @@ CV_N_FOLDS <- 5
 Apart from loading dataset, we also perform **stratified_sampling** where we pick 10% of observations for each day_type. This ensures that each category is represented with respect to its proportion in data.
 
 ```{r}
-
 timetable <- read_csv("../data/interim/dataset.csv")
 
 table(timetable$day_type)
+```
 
-set.seed(42)
+### Stratified Sampling
 
-# Stratified group sample: 10% trip_id v rámci kazdeho day_type
+The dataset was reduced using a stratified sampling approach to ensure computational efficiency while preserving its original structure. Specifically, a 10% sample of unique trip_id values was selected within each category of the day_type variable, ensuring that the relative distribution of day types remained consistent.
+
+```{r}
+set.seed(SEED)
+
 sampled_trips <- timetable %>%
   distinct(trip_id, day_type) %>%
   group_by(day_type) %>%
-  slice_sample(prop = 0.1) %>%
+  slice_sample(prop = SLICE_SAMPLE) %>%
   ungroup() %>%
   pull(trip_id)
 
-# Vyfiltruj vsetky riadky patriace tym tripom
 timetable <- timetable %>%
   filter(trip_id %in% sampled_trips)
 
-# Sanity check - proporcie day_type by mali byt zachovane
 table(timetable$day_type)
 ```
+
+### Viewing Raw Data
 
 Now we can take a lot at the dataset to see its structure and info about its columns.
 
 ```{r}
-
 glimpse(timetable)
 ```
 
 ### Data Preparation
 
-By performing brief initial inspection of data we noticed several problems:
+An initial exploratory inspection of the dataset revealed several data quality issues that needed to be addressed prior to modelling. These included the presence of missing or sparsely populated values, constant or near-constant features, uninformative attributes (such as URLs or descriptive text), and unsupported data types (e.g., raw strings or time formats not directly suitable for modelling).
 
-1.  **Missing or sparse** (some columns clearly contain NA values)
-2.  **Constant or Near-Constant Columns**
-3.  **Uninformative columns** (urls, descriptions, etc.)
-4.  **Unsupported columns types** (strings, time, etc.)
-
-These problems and more will need to be dealt with during this phase. We are going to turn this unsuitable format into nice training-ready data.
+To ensure compatibility with machine learning algorithms and improve model performance, these issues were systematically resolved during the data preparation phase. The objective of this step was to transform the raw dataset into a structured, consistent, and training-ready format suitable for subsequent analysis and modelling tasks.
 
 #### Utility Functions
 
 In this section we define a set of utility function that we are going to use in the later phases. Both of the functions do the same - they take a vector of columns names or row indices and drop it from the dataset. Apart from this, they also print some nice logs into console about the reduction.
 
 ```{r}
-drop_cols_report <- function(data, cols_to_drop) {
-  # 1. Store the initial count
+drop_cols_report <- function(data, cols_to_drop, label = NULL) {
   col_num_before <- ncol(data)
   
-  # 2. Perform the drop
-  # We use any_of() instead of all_of() to prevent errors 
-  # if a column was already dropped previously.
   data_reduced <- data %>%
     select(!any_of(cols_to_drop))
   
-  # 3. Calculate difference
   col_num_after <- ncol(data_reduced)
   dropped_count <- col_num_before - col_num_after
   
-  # 4. Print the report
-  message(paste0("Dropped cols: ", dropped_count, 
-                 " - Current size: ", col_num_after))
+  label_text <- if (!is.null(label)) paste0("[", label, "] ") else ""
   
-  # 5. Return the cleaned dataframe
+  message(paste0(
+    label_text,
+    "Dropped cols: ", dropped_count,
+    " | Current size: ", col_num_after
+  ))
+  
   return(data_reduced)
 }
 
@@ -210,10 +191,6 @@ drop_rows_report <- function(data, rows_to_drop) {
 }
 
 find_duplicate_columns <- function(df) {
-  # dup_col_indexes <- which(duplicated(as.list(df)))
-  # dup_cols <- names(df)[dup_col_indexes]
-  # 
-  # return(dup_cols)
   is_dup <- duplicated(as.list(df))
   
   dup_summary <- tibble::tibble(
@@ -229,19 +206,7 @@ find_duplicate_columns <- function(df) {
 #    Returns the original dataset with encoded columns added
 #    and the original column removed.
 # =========================================================
-# one_hot_encode <- function(data, col) {
-#   data[[col]] <- as.factor(data[[col]])
-#   
-#   mm <- model.matrix(
-#     as.formula(paste0("~ `", col, "` - 1")),
-#     data = data
-#   ) %>%
-#     as.data.frame()
-#   
-#   data %>%
-#     bind_cols(mm) %>%
-#     select(-all_of(col))
-# }
+
 one_hot_encode <- function(data, col) {
   data[[col]] <- as.factor(data[[col]])
   
@@ -318,10 +283,11 @@ Throughout the following sections we are going to do the same:
 
 This structured format ensures that they can be effectively dropped by the reusable functions defined earlier.
 
-In the below code we create a summary of missing values for every columns using *is.na()* provided by base R. The summaries are then split into 2 vectors containing:
+In the code below, we create a summary of missing values for every columns using *is.na()* provided by base R. The summaries are then split into 2 vectors containing:
 
-1.  **low-missing features** (0\>missing_pct\>50): can be kept and handled by methods like imputing, etc.
-2.  **high-missing features**: (missing_pct\>=50): problematic - should be dropped right away
+1. **Low-missing features** (0 < missing_pct < 50): These features are generally retained and handled using imputation techniques (e.g., mean, median, or model-based imputation), as sufficient information is available to preserve their predictive value.
+
+2. **High-missing features** (missing_pct ≥ 50): These features are potentially problematic, as the large proportion of missing values may reduce their reliability. Such features are typically removed
 
 ```{r}
 # 1. Missing values
@@ -331,36 +297,15 @@ missing_summary <- timetable %>%
   summarise(across(everything(), ~ sum(is.na(.)))) %>%
   pivot_longer(cols = everything(), names_to = "column", values_to = "missing_count") %>%
   mutate(missing_pct = missing_count / nrow(timetable) * 100) %>%
+  filter(missing_pct > 0) %>%
   arrange(desc(missing_pct))
 
 missing_summary
-
-# ===
-# 1.1 Low_missing features (can be kept - must be imputed)
-# ===
-
-low_missing <- missing_summary %>%
-  filter(missing_pct > 0 & missing_pct < 50) %>%
-  pull(column)
-
-low_missing
-
-# ===
-# 1.2 High missing features (must be removed)
-# ===
-
-high_missing <- missing_summary %>%
-  filter(missing_pct >= 50) %>%
-  pull(column)
-
-high_missing
-
 ```
 
 #### Constant & Near-Constant Features
 
-These are features that carry no or only minimal signal and would only cause model to overfit they should be dropped too.\
-We identify near-constant features by calculating the ratio between the 2 largest frequencies identified in a column. If this ratio is above 20 we consider this column to be near-constant.
+These are features that carry no or only minimal signal and would only cause model to overfit they should be dropped too.
 
 ```{r}
 # =========================
@@ -369,9 +314,13 @@ We identify near-constant features by calculating the ratio between the 2 larges
 variance_summary <- timetable %>%
   summarise(across(everything(), ~ n_distinct(.))) %>%
   pivot_longer(cols = everything(), names_to = "column", values_to = "n_unique") %>%
-  arrange(desc(n_unique))
+  arrange(n_unique)
 variance_summary
+```
 
+##### Constant Features
+
+```{r}
 # ===
 # 2.1 Constant features (should be dropped immediately)
 # ===
@@ -381,11 +330,11 @@ constant_features <- variance_summary %>%
 
 constant_features
 
-# ===
-# 2.2 Near-zero variance (should be dropped too, too weak predictors)
-# ===
+```
+##### Near-Constant Features
+We identify near-constant features by calculating the ratio between the 2 largest frequencies identified in a column. If this ratio is above 20 we consider this column to be near-constant.
 
-
+```{r}
 # formula: ratio = freq_1 / freq_2
 nzv_summary <- timetable %>%
   summarise(across(everything(), ~ {
@@ -398,7 +347,7 @@ nzv_summary <- timetable %>%
 
 print(nzv_summary)
 
-# Threshold example: freq_ratio > 20
+
 nzv_cols <- nzv_summary %>%
   filter(freq_ratio > 20) %>%
   pull(column)
@@ -408,117 +357,56 @@ print(nzv_cols)
 
 #### Handling Duplicates
 
-Now we also verify whether dataset doesn't contain duplicate rows (stored as vector of row indices) and duplicate columns (stored as vector of column names). Please note that function *find_duplicate_cols* iteratively examines column by column comparing it with previous ones. This way it also finds such columns which contain only NaN values.
+Now we also verify whether dataset doesn't contain duplicate rows (stored as vector of row indices) and duplicate columns (stored as vector of column names).
+
+##### Duplicate Rows
 
 ```{r}
-
-# =========================
-# 4. Handling duplicates
-# =========================
-
-# ===
-# 4.1 Duplicate rows (should be removed)
-# ===
-
 dup_row_indexes <- timetable %>%
   duplicated() %>%
   which()
 
-print(paste("Duplicate rows:", dup_row_indexes))
+print(paste("Duplicate row count:", length(dup_row_indexes)))
 
-# ===
-# 4.2 Duplicate cols (should be removed)
-# ===
+```
 
+##### Duplicate Cols
 
+The function `find_duplicate_columns` identifies duplicate columns by treating the dataset as a list of column vectors and applying the `duplicated()` function. This approach detects columns that have identical values to a previously encountered column.  It also includes edge cases such as columns containing only missing values (e.g., all `NA`), which are also considered duplicates if more than one such column exists.
+
+```{r}
 # More efficient check for duplicate columns
 # R looks at the "top level" of the data frame. duplicated() now looks at each 
 # vector (column) as a single item in a list and compares them.
-# dup_col_indexes <- which(duplicated(as.list(timetable)))
-# dup_cols <- names(timetable)[dup_col_indexes]
 dup_cols <- find_duplicate_columns(timetable)
 
 paste("Duplicate cols")
 dup_cols
 ```
+##### Highly Correlated Features
 
-#### High-cardinality Columns
-
-In this section we create summary about cardinality of character columns by using *n_distinct* and *n_unique* properties. These columns will need to be handled differently from one-hot-encoding since this would result in very large dataset.
+Several features were identified as highly redundant due to their strong correlation with derived or engineered variables and were therefore removed from the dataset. In many cases, these original attributes served primarily as intermediate representations used to construct more informative features. For example, the *arrival_time* variable (stored in datetime format) was decomposed into components such as hour and minute, which better capture temporal patterns. Similarly, the *service_id* variable encodes predefined combinations of weekday indicators (*monday–sunday*), which were consolidated into a more interpretable categorical feature (*day_type*). The *shape_id* attribute was transformed into a continuous variable representing route geometry, namely *shape_distance*, computed as the cumulative Euclidean distance between stops. Additionally, identifiers such as *stop_id* were found to be redundant with other attributes (e.g., *stop_code*), and thus removed to reduce multicollinearity.
 
 ```{r}
-
-# =========================
-# 5. High cardinality categorical variables
-# =========================
-cat_summary <- timetable %>%
-  select(where(is.character)) %>%
-  summarise(across(everything(), n_distinct)) %>%
-  pivot_longer(cols = everything(), names_to = "column", values_to = "n_unique") %>%
-  arrange(desc(n_unique))
-
-print(cat_summary)
-
-# ===
-# Columns with too many categories (characters)
-# ===
-high_cardinality <- cat_summary %>%
-  filter(n_unique > 10)
-high_cardinality
-
-high_cardinality_cols <- high_cardinality %>% pull(column)
-high_cardinality_cols
+highly_correlated_features = c('arrival_time', 'service_id', 'shape_id', 'stop_id',
+                           'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+                           'saturday', 'sunday', 'stop_sequence')
 ```
+
 
 #### Feature Reduction
 
-The problematic features like highly-sparse features, constant or near-constant features are quite useless for models and should be dropped right away using the utility functions.
+Problematic attributes, such as highly sparse features, constant or near-constant variables, duplicate columns, and duplicate observations, provide little or no useful information for model training. Therefore, these features and rows were removed. This resulted in a cleaner and more compact dataset suitable for subsequent preprocessing, feature engineering, and modelling.
 
 ```{r}
-timetable_reduced <- drop_cols_report(timetable, high_missing)
-timetable_reduced <- drop_cols_report(timetable_reduced, constant_features)
-timetable_reduced <- drop_cols_report(timetable_reduced, nzv_cols)
+timetable_reduced <- drop_cols_report(timetable, high_missing, label = "high missing")
+timetable_reduced <- drop_cols_report(timetable_reduced, constant_features, label = "constant features")
+timetable_reduced <- drop_cols_report(timetable_reduced, nzv_cols, label = "near-constan features")
 timetable_reduced <- drop_rows_report(timetable_reduced, dup_row_indexes)
-timetable_reduced <- drop_cols_report(timetable_reduced, dup_cols)
+timetable_reduced <- drop_cols_report(timetable_reduced, dup_cols, label = "duplicate cols")
+timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated_features, label = "highly_correlated")
 
-dup_cols
 glimpse(timetable_reduced)
-
-table(timetable_reduced$arrival_time_second)
-# # ===
-# # 7.7 Highly-correlated cols
-# # ===
-# 
-# timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated)
-
-# glimpse(timetable_reduced)
-
-# ===
-# 7.8 Irrelevant cols
-# ===
-# these were used during extraction process and were broken into several predictors
-# ===
-
-highly_correlated_char = c('arrival_time', 'service_id', 'shape_id', 'stop_id',
-                           'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
-                           'saturday', 'sunday', 'stop_sequence')
-timetable_reduced <- drop_cols_report(timetable_reduced, highly_correlated_char)
-
-# ===
-# 7.8 Irrelevant cols
-# ===
-
-# these should not be in the dataset after extraction update and remove from here!!
-# irrelevant_features = c('day_type')
-
-# timetable_reduced <- drop_cols_report(timetable_reduced, irrelevant_features)
-
-# ===
-# 7.9 Basic info after filtering
-# ===
-dim(timetable_reduced)
-glimpse(timetable_reduced)
-
 ```
 
 #### Handling low-missing features
@@ -535,17 +423,13 @@ This one is calculated as:
 
 *time_since_last_stop = arrival_seconds - prev(departure_seconds)*
 
-where *prev()* represents the previous stop within a trip (sorted by *stop_sequence*). The NaN values logically represent the first stop within a trip which doesn't have a previous stop. Thus, we apply imputation with 0:
+where *prev()* represents the previous stop within a trip (sorted by *stop_sequence*). 
 
 ```{r}
 summary(timetable_reduced$time_since_last_stop)
 ```
-
+The NaN values logically represent the first stop within a trip which doesn't have a previous stop. Thus, we apply imputation with 0:
 ```{r}
-# ===
-# 8.1 Time_since_last_stop
-# ===
-# These are first stops in a trip
 
 timetable_imputed <- timetable_reduced %>%
   mutate(
@@ -562,20 +446,6 @@ table(timetable_imputed$wheelchair_accessible)
 timetable_imputed <- drop_cols_report(timetable_imputed, c('wheelchair_accessible'))
 ```
 
-```{r}
-# =========================
-# 9. Handling categorical values
-# =========================
-
-# # Scan all character columns and count unique values
-# unique_counts <- timetable_imputed %>%
-#   summarise(across(where(is.character), ~n_distinct(.))) %>%
-#   pivot_longer(cols = everything(), names_to = "column_name", values_to = "unique_count")
-# 
-# print(unique_counts)
-# print(cat_summary)
-```
-
 #### Feature Encoding
 
 Now, the remaining preprocessing step focuses on encoding categorical and non-ordinal features. Three main techniques were applied:
@@ -583,6 +453,8 @@ Now, the remaining preprocessing step focuses on encoding categorical and non-or
 1.  **One-hot encoding**: Used for categorical features with relatively low cardinality (typically fewer than 15 unique values) to preserve interpretability while avoiding excessive dimensionality.
 2.  **Frequency encoding**: Applied to high-cardinality categorical features, where one-hot encoding would lead to a large number of sparse columns. This approach replaces each category with its relative frequency, retaining distributional information in a compact form.
 3.  **Feature transformation and decomposition**: Certain features were transformed into more informative numerical representations. For example, hexadecimal color codes were decomposed into RGB components.
+
+In contrast to one-hot encoding, frequency encoding is applied after the train/test split to prevent data leakage. Specifically, frequency mappings are learned exclusively from the training data and then applied to both training and testing sets. This ensures that information from the test set does not influence the encoding process, thereby preserving the integrity of model evaluation and avoiding overly optimistic performance estimates.
 
 ```{r}
 glimpse(timetable_imputed)
@@ -592,40 +464,14 @@ timetable_encoded <- timetable_imputed %>%
   one_hot_encode("day_type") %>%
   one_hot_encode("zone_id") %>%
   one_hot_encode("direction_id") %>%
-  # one_hot_encode("wheelchair_accessible") %>%
   one_hot_encode("pickup_type") %>%
   one_hot_encode("route_type") %>%
   hex_to_rgb_df("route_color", prefix = "route") %>%
-  # frequency_encode("route_short_name") %>%
-  # frequency_encode("route_id") %>%
-  # frequency_encode("trip_headsign") %>%
-  # frequency_encode("stop_name") %>%
-  # frequency_encode("stop_code") %>%
   select(
     -route_color,
-    # -route_short_name,
-    # -route_id,
-    # -trip_headsign,
-    # -stop_name,
-    # -stop_code
   )
 
-dup_cols_2 <- find_duplicate_columns(timetable_encoded)
-dup_cols_2
-
-# timetable_encoded$daytimetable_encoded
 glimpse(timetable_encoded)
-```
-
-#### Detecting duplicates
-
-Let's check again whether there are no duplicate columns in the dataset.
-
-```{r}
-dup_cols_2 <- find_duplicate_columns(timetable_encoded)
-dup_cols_2
-
-timetable_encoded <- drop_cols_report(timetable_encoded, dup_cols_2)
 ```
 
 #### Saving Dataset
@@ -654,10 +500,8 @@ Based on these insights, appropriate transformations and feature selection strat
 #### Loading Data
 
 ```{r}
-
 timetable_encoded <- readRDS("./datasets/timetable_encoded.rds")
 glimpse(timetable_encoded)
-
 ```
 
 #### Utility Functions
@@ -873,8 +717,6 @@ Now we can also analyze the distribution of our target variable
 ```{r}
 
 plot_hist_dist(timetable_encoded, TARGET, bins = 30, show_density = FALSE)
-# table(timetable_encoded$segment_time_s)
-summary(timetable_encoded$segment_time_s)
 ```
 
 Most observations are concentrated around **60 seconds**, with a gradual tail toward higher values. This indicates that **typical segment travel times are short**, while longer durations occur less frequently but extend the upper range.
@@ -928,43 +770,11 @@ ggplot(timetable_engineered, aes(x = sin_time, y = cos_time)) +
 
 The joint visualization of these features confirms their correct transformation, forming a well-defined circular structure, which indicates that the periodic nature of time has been successfully preserved.
 
-```{r}
-subset_data <- select_correlated_features(
-  data = timetable_encoded,
-  target_col = "segment_time_s",
-  min_abs_cor = 0.05,
-  always_keep = c("seconds_since_midnight", "route_short_name_freq")
-)
-
-glimpse(subset_data)
-
-
-collinear_features <- c()
-
-subset_data_filtered <- subset_data %>%
-  select(-all_of(collinear_features))
-
-
-```
-
 #### Checking multicollinearity & target collinearity
 
-One of the requirements of regression models like linear or polynomial regression is that its predictors should not be heavily correlated. To verify this in a neat way we are going to print the correlation matrix in the form of **HeatMap**.
+One of the key assumptions of linear and polynomial regression models is the absence of strong multicollinearity among predictor variables, as highly correlated features can distort coefficient estimates and reduce model interpretability. To assess this, a correlation matrix was computed and visualized using a heatmap, allowing for a clear inspection of pairwise relationships between variables.
 
-Since there is a lot of features currently in the dataset we apply this
-
-```{r}
-timetable_selected <- select_correlated_features(timetable_engineered, min_abs_cor = 0.1, target_col = "segment_time_s")
-
-glimpse(timetable_selected)
-
-# summary(timetable_engineered$arrival_seconds)
-
-
-plot_correlation_heatmap(timetable_selected, threshold = 0.01)
-```
-
-From the observed results we can tell that there is no serious collinearity among features apart from *cos_time* and *distance_cos_interaction*
+The results indicate several strong correlations among features, particularly between *cos_time* and *distance_cos_interaction* , as well as between *sin_time* and *distance_sin_interaction*. These relationships are expected, since the interaction features are directly derived from their respective base variables. Additionally, strong negative correlations are observed between temporal sine/cosine components and variables such as *seconds_since_midnight* and *arrival_seconds*, reflecting their cyclical encoding.
 
 ```{r}
 correlated_features <- c('cos_time', 'distance_cos_interaction', 'sin_time', 'distance_sin_interaction',
@@ -972,14 +782,10 @@ correlated_features <- c('cos_time', 'distance_cos_interaction', 'sin_time', 'di
 
 plot_correlation_heatmap(
   timetable_engineered %>% 
-    select(all_of(c(correlated_features, "segment_time_s")))
+    select(all_of(c(correlated_features, "segment_time_s"))) %>%
+    select(-all_of(c(TARGET)))
 )
 
-```
-
-```{r}
-highly_collineared_features <- c('zone_id101')
-timetable_engineered <- drop_cols_report(timetable_engineered, highly_collineared_features)
 ```
 
 #### Outliers
@@ -989,30 +795,12 @@ Extreme outliers are also problematic for regression models. Let's visualize the
 ##### Boxplots
 
 ```{r}
-combined_plot <- plot_predictor_boxplots(timetable_selected)
+
+skewed_features <- c('segment_distance_m', 'distance_sin_interaction',
+                          'distance_cos_interaction')
+
+combined_plot <- plot_predictor_boxplots(timetable_engineered %>% select(all_of(skewed_features)))
 print(combined_plot)
-```
-
-From the bopxlots that mainly distance and time feature and their interactions have a lot of outliers and that heir distributions are hard to see. Let's analyze this further by inspecting their distributions
-
-##### Distributions
-
-```{r}
-problematic_features <- c('segment_distance_m', 'distance_cos_interaction',
-                          'distance_sin_interaction', 'time_since_last_stop')
-
-plot_boxplot <- function(data, feature){
-  ggplot(data, aes(x = .data[[feature]])) +
-    geom_histogram(bins = 50, fill = "steelblue") +
-    # scale_x_log10() +
-    theme_minimal()
-}
-
-plot_boxplot(timetable_selected, 'segment_distance_m')
-plot_boxplot(timetable_selected, 'time_since_last_stop')
-
-# summary(timetable_selected %>% select(all_of(problematic_features)))
-
 ```
 
 ##### Transformations
@@ -1020,7 +808,7 @@ plot_boxplot(timetable_selected, 'time_since_last_stop')
 Based on the analysis of the predictors with most outliers and their distributions, we recommend following before using them in training:
 
 1.  *segment_distance_m* -\> very long tail, strong right skew, **log_transform** recommended
-2.  *distance_interactions* -\> also heavy tails, caused by distance metric. Log cannot be applied for negative values, so transforming distance and the recomputing is recommended 3 *time_since_last_stop* -\> only moderate skew and some extremes, recommended removal if not significant model
+2.  *distance_interactions* -\> also heavy tails, caused by distance metric. Log cannot be applied for negative values, so transforming distance and the recomputing is recommended
 
 ### Saving Data
 
@@ -1292,6 +1080,18 @@ plot_predicted_vs_actual <- function(
     )
 }
 
+plot_qq <- function(residuals, title = "QQ Plot") {
+  data.frame(residuals = residuals) %>%
+    ggplot(aes(sample = residuals)) +
+    stat_qq(alpha = 0.3) +
+    stat_qq_line(color = "red") +
+    theme_minimal() +
+    labs(
+      title = title,
+      subtitle = "Check of residual normality"
+    )
+}
+
 # ---- Feature Selection ---- #
 
 select_model_features <- function(data, features = NULL, target = "segment_time_s") {
@@ -1429,14 +1229,13 @@ Several predictors—especially interaction terms—demonstrate clear non-linear
 
 ```{r}
 saveRDS(timetable_transformed, './datasets/training_ready_data.rds')
+
+# timetable_transformed$route_id
 ```
 
 ### Train/Test Split & Frequency Encoding
 
 ```{r}
-# ===
-# 12.1 Train / test split
-# ===
 
 create_train_test_split <- function(data, seed = 42) {
   set.seed(seed)
@@ -1482,7 +1281,14 @@ create_train_test_split <- function(data, seed = 42) {
     test_data  <- apply_frequency_encoding(test_data, freq_table, col)
   }
   
-  list(train = train_data, test = test_data)
+  dup_cols <- find_duplicate_columns(train_data)
+  train_data <- drop_cols_report(train_data, dup_cols, label = paste0("train - duplicate col "))
+  
+  test_data <- drop_cols_report(test_data, dup_cols, label = paste0("test - duplicate col"))
+                                 
+  
+  
+  list(train = train_data, test = test_data, dup_cols = dup_cols)
 }
 
 ```
@@ -1544,6 +1350,7 @@ split <- create_train_test_split(timetable_transformed, seed = SEED)
 
 train_data <- split$train
 test_data  <- split$test
+
 
 folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
 ```
@@ -1704,27 +1511,24 @@ results_lm <- eval_train_test(
 )
 
 results_lm
-
-# predictions_lm <- predict(lm_model, newdata = test_data)
-# 
-# results_lm <- evaluate_regression(
-#   actual = test_data$segment_time_s,
-#   predicted = predictions_lm,
-#   model_name = "Linear Regression"
-# )
-# 
-# results_lm
 ```
 
-#### Predicted vs. Actual
+##### Predicted vs. Actual
 
 ```{r}
 plot_predicted_vs_actual(
   data = test_data,
-  predictions = predictions_lm,
+  predictions = predict_lm(lm_step, test_data),
   target = "segment_time_s",
   title = "Linear Regression: Predicted vs Actual"
 )
+```
+
+##### Normality of Residuals
+
+```{r}
+plot_qq(residuals = residuals(lm_step))
+
 ```
 
 ### Polynomial Regression
@@ -1875,15 +1679,22 @@ results_lm_poly
 # predictions_lm <- round(predictions_lm / 15) * 15
 ```
 
-#### Predicted vs. Actual
+##### Predicted vs. Actual
 
 ```{r}
 plot_predicted_vs_actual(
   data = test_data,
-  predictions = predictions_lm_poly,
+  predictions = predict_lm(lm_poly, test_data),
   target = "segment_time_s",
   title = "Polynomial Regression: Predicted vs Actual"
 )
+```
+
+##### Normality of Resituals
+
+```{r}
+
+plot_qq(residuals = residuals(lm_poly))
 ```
 
 ### Lasso Regression

@@ -6,10 +6,16 @@ library(ranger)
 
 source("R/utils.R")
 
-default_data <- readRDS("../../datasets/training_ready_data.rds")
+# default_data <- readRDS("../../datasets/training_ready_data.rds")
 
 ui <- fluidPage(
   titlePanel("Regression Model Comparison"),
+  
+  tags$style(HTML("
+    #predictors {
+      column-count: 2;
+    }
+  ")),
   
   sidebarLayout(
     sidebarPanel(
@@ -21,7 +27,13 @@ ui <- fluidPage(
       
       selectInput("target", "Target variable:", choices = NULL),
       
-      checkboxGroupInput("predictors", "Predictors:", choices = NULL),
+      checkboxGroupInput(
+        "predictors",
+        "Predictors:",
+        choices = NULL,
+        selected = NULL,
+        inline = FALSE
+      ),
       
       sliderInput("train_split", "Training split:",
                   min = 0.5, max = 0.9, value = 0.8),
@@ -54,7 +66,9 @@ ui <- fluidPage(
                     value = 200, step = 50),
         sliderInput("rf_mtry", "mtry:", min = 1, max = 30, value = 6),
         sliderInput("rf_min_node", "Min node size:", min = 1, max = 50, value = 10)
-      )
+      ),
+      
+      actionButton("fit_model", "Fit / Update model", class = "btn-primary")
     ),
     
     mainPanel(
@@ -62,6 +76,8 @@ ui <- fluidPage(
         tabPanel("Data Preview", tableOutput("data_preview")),
         tabPanel("Predicted vs Actual", plotOutput("pred_actual")),
         tabPanel("Residuals", plotOutput("residuals")),
+        tabPanel("Scale-Location", plotOutput("scale_location")),
+        tabPanel("QQ Plot", plotOutput("qq_plot")),
         tabPanel("Metrics", tableOutput("metrics")),
         tabPanel("Selected Features", tableOutput("selected_features"))
       )
@@ -72,20 +88,19 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   
   dataset <- reactive({
-    if (is.null(input$file)) {
-      default_data
+    req(input$file)
+    
+    path <- input$file$datapath
+    
+    if (stringr::str_ends(input$file$name, ".rds")) {
+      readRDS(path)
     } else {
-      path <- input$file$datapath
-      
-      if (str_ends(input$file$name, ".rds")) {
-        readRDS(path)
-      } else {
-        read.csv(path)
-      }
+      read.csv(path)
     }
   })
   
   observe({
+    req(dataset())
     data <- dataset()
     
     numeric_cols <- names(data)[sapply(data, is.numeric)]
@@ -99,8 +114,9 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$target, {
-    data <- dataset()
+    req(dataset())
     
+    data <- dataset()
     numeric_cols <- names(data)[sapply(data, is.numeric)]
     predictor_choices <- setdiff(numeric_cols, input$target)
     
@@ -108,17 +124,19 @@ server <- function(input, output, session) {
       session,
       "predictors",
       choices = predictor_choices,
-      selected = head(predictor_choices, 8)
+      selected = predictor_choices
     )
   })
   
-  fit <- reactive({
+  fit <- eventReactive(input$fit_model, {
+    req(dataset())
     req(input$target)
     req(input$predictors)
     
     validate(
       need(length(input$predictors) > 0, "Select at least one predictor.")
     )
+    
     
     fit_selected_model(
       data = dataset(),
@@ -137,11 +155,21 @@ server <- function(input, output, session) {
     )
   })
   
+  # output$data_preview <- renderTable({
+  #   req(dataset())
+  #   head(dataset(), 10)
+  # })
+  
   output$data_preview <- renderTable({
+    validate(
+      need(!is.null(input$file), "Please upload a .rds or .csv dataset first.")
+    )
+    
     head(dataset(), 10)
   })
   
   output$pred_actual <- renderPlot({
+    req(fit())
     fit_obj <- fit()
     
     plot_predicted_vs_actual(
@@ -152,6 +180,7 @@ server <- function(input, output, session) {
   })
   
   output$residuals <- renderPlot({
+    req(fit())
     fit_obj <- fit()
     
     plot_residuals(
@@ -161,11 +190,38 @@ server <- function(input, output, session) {
     )
   })
   
+  output$scale_location <- renderPlot({
+    req(fit())
+    fit_obj <- fit()
+    
+    residuals <- fit_obj$test_actual - fit_obj$pred_test
+    
+    plot_scale_location(
+      fitted = fit_obj$pred_test,
+      residuals = residuals,
+      title = paste(input$model, ": Scale-Location Plot")
+    )
+  })
+  
+  output$qq_plot <- renderPlot({
+    req(fit())
+    fit_obj <- fit()
+    
+    residuals <- fit_obj$test_actual - fit_obj$pred_test
+    
+    plot_qq(
+      residuals,
+      title = paste(input$model, ": QQ Plot")
+    )
+  })
+  
   output$metrics <- renderTable({
+    req(fit())
     fit()$metrics
   })
   
   output$selected_features <- renderTable({
+    req(fit())
     tibble(
       selected_feature = fit()$selected_features
     )
