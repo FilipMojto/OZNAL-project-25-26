@@ -91,7 +91,8 @@ library("patchwork")
 
 library("purrr")
 library("car")
-library("randomForest")
+library("randomForest") # faster rf fit
+library("rpart") # decision tree
 library("ranger")
 library("glmnet") # for lasso regression
 library("rsample") # for cv
@@ -104,6 +105,8 @@ library("rsample") # for cv
 ```{r}
 
 TARGET <- 'segment_time_s'
+SEED <- 42
+CV_N_FOLDS <- 5
 
 ```
 
@@ -846,6 +849,21 @@ plot_predictor_boxplots <- function(
   return(combined_plot)
 }
 
+# --- Engineering --- #
+
+
+add_engineered_features <- function(df){
+  df_engineered <- df %>%
+    mutate(
+      sin_time = sin(2 * pi * seconds_since_midnight / 86400),
+      cos_time = cos(2 * pi * seconds_since_midnight / 86400),
+      distance_sin_interaction = segment_distance_m * sin_time,
+      distance_cos_interaction = segment_distance_m * cos_time,
+    )
+  
+  return(df_engineered)
+}
+
 ```
 
 #### Target Distribution
@@ -926,21 +944,6 @@ collinear_features <- c()
 subset_data_filtered <- subset_data %>%
   select(-all_of(collinear_features))
 
-
-# --- Engineering --- #
-
-
-add_engineered_features <- function(df){
-  df_engineered <- df %>%
-    mutate(
-      sin_time = sin(2 * pi * seconds_since_midnight / 86400),
-      cos_time = cos(2 * pi * seconds_since_midnight / 86400),
-      distance_sin_interaction = segment_distance_m * sin_time,
-      distance_cos_interaction = segment_distance_m * cos_time,
-    )
-  
-  return(df_engineered)
-}
 
 ```
 
@@ -1189,6 +1192,44 @@ eval_metrics <- function(actual, predicted) {
   )
 }
 
+# used for LR, PR, DT, RF
+eval_train_test <- function(model, model_label, train_data, test_data, predict_fun) {
+  pred_train <- predict_fun(model, train_data)
+  pred_test  <- predict_fun(model, test_data)
+  
+  dplyr::bind_rows(
+    evaluate_regression(
+      actual = train_data$segment_time_s,
+      predicted = pred_train,
+      model_name = paste0(model_label, " train")
+    ),
+    evaluate_regression(
+      actual = test_data$segment_time_s,
+      predicted = pred_test,
+      model_name = paste0(model_label, " test")
+    )
+  )
+}
+
+# used for LASSO/ElASTIC
+eval_train_test_glmnet <- function(model, model_label, x_train, y_train, x_test, y_test) {
+  pred_train <- as.vector(predict(model, newx = x_train))
+  pred_test  <- as.vector(predict(model, newx = x_test))
+  
+  dplyr::bind_rows(
+    evaluate_regression(
+      actual = y_train,
+      predicted = pred_train,
+      model_name = paste0(model_label, " train")
+    ),
+    evaluate_regression(
+      actual = y_test,
+      predicted = pred_test,
+      model_name = paste0(model_label, " test")
+    )
+  )
+}
+
 plot_predicted_vs_actual <- function(
   data,
   predictions,
@@ -1297,6 +1338,36 @@ apply_frequency_encoding <- function(df, freq_table, col) {
     dplyr::select(-dplyr::all_of(col))
 }
 
+
+# ---- Lasso & Elastic Helpers ---- #
+
+prepare_glmnet_data <- function(train_data, test_data, target) {
+  feature_names <- setdiff(names(train_data), target)
+  
+  x_train <- as.matrix(train_data[, feature_names])
+  y_train <- train_data[[target]]
+  
+  x_test <- as.matrix(test_data[, feature_names])
+  y_test <- test_data[[target]]
+  
+  list(
+    x_train = x_train,
+    y_train = y_train,
+    x_test = x_test,
+    y_test = y_test,
+    feature_names = feature_names
+  )
+}
+
+# ---- VIF Helpers (LR, PR) ----
+
+format_vif <- function(vif_values) {
+  data.frame(
+    feature = names(vif_values),
+    vif = as.numeric(vif_values)
+  ) %>%
+    dplyr::arrange(desc(vif))
+}
 ```
 
 ### Loading Data
@@ -1307,14 +1378,11 @@ The predictor `time_since_last_stop` was removed prior to model training, as it 
 timetable <- readRDS("./datasets/timetable_engineered.rds")
 # glimpse(timetable)library("ranger")
 
-glimpse(timetable)
+# glimpse(timetable)
 
 features_to_drop <- c('time_since_last_stop')
 
 timetable <- drop_cols_report(timetable, features_to_drop)
-
-
-
 ```
 
 ### Transformations
@@ -1355,7 +1423,132 @@ plot_predictor_boxplots(timetable_transformed %>% select(problematic_features), 
 
 From the box plots above it is clear that the skewness has been successfully eliminated for all the problematic features.
 
-### Checking Relationships
+Several predictors—especially interaction terms—demonstrate clear non-linear relationships with the target, indicating that linear models alone may be insufficient and that incorporating non-linear transformations or more flexible models is justified.
+
+### Saving Training-Ready Data
+
+```{r}
+saveRDS(timetable_transformed, './datasets/training_ready_data.rds')
+```
+
+### Train/Test Split & Frequency Encoding
+
+```{r}
+# ===
+# 12.1 Train / test split
+# ===
+
+create_train_test_split <- function(data, seed = 42) {
+  set.seed(seed)
+  
+  # 1. Vyber 80% trip_id (nie riadkov)
+  unique_trips <- unique(data$trip_id)
+  train_trips <- sample(unique_trips, size = 0.8 * length(unique_trips))
+  
+  # 2. Filter podla trip_id - cely trip ide bud do trainu, alebo do testu
+  train_data <- data %>%
+    filter(trip_id %in% train_trips)
+  
+  test_data <- data %>%
+    filter(!trip_id %in% train_trips)
+  
+  # 3. Sanity check - ziadny trip nesmie byt v oboch
+  shared_trips <- intersect(unique(train_data$trip_id), unique(test_data$trip_id))
+  stopifnot(length(shared_trips) == 0)
+  
+  cat("Train trips:", length(unique(train_data$trip_id)), 
+      "| Test trips:", length(unique(test_data$trip_id)), "\n")
+  cat("Train rows:", nrow(train_data), 
+      "| Test rows:", nrow(test_data), "\n")
+  
+  # 4. Az teraz dropnut trip_id - v modeli ho nechces
+  train_data <- train_data %>% select(-trip_id)
+  test_data  <- test_data  %>% select(-trip_id)
+  
+  freq_cols <- c(
+    "route_short_name",
+    "route_id",
+    "trip_headsign",
+    "stop_name",
+    "stop_code"
+  )
+  
+  # glimpse(train_data)
+  
+  for (col in freq_cols) {
+    freq_table <- fit_frequency_encoding(train_data, col)
+    
+    train_data <- apply_frequency_encoding(train_data, freq_table, col)
+    test_data  <- apply_frequency_encoding(test_data, freq_table, col)
+  }
+  
+  list(train = train_data, test = test_data)
+}
+
+```
+
+#### Frequency Encoding
+
+```{r}
+# freq_cols <- c(
+#   "route_short_name",
+#   "route_id",
+#   "trip_headsign",
+#   "stop_name",
+#   "stop_code"
+# )
+# 
+# glimpse(train_data)
+# 
+# for (col in freq_cols) {
+#   freq_table <- fit_frequency_encoding(train_data, col)
+#   
+#   train_data <- apply_frequency_encoding(train_data, freq_table, col)
+#   test_data  <- apply_frequency_encoding(test_data, freq_table, col)
+# }
+```
+
+#### Folds
+
+```{r}
+# set.seed(42)
+
+create_folds <- function(train_data, v = CV_N_FOLD, seed = SEED){
+  folds <- vfold_cv(train_data, v = v)
+}
+```
+
+### Keep-only Features (for testing)
+
+```{r}
+# features_distance <- c("segment_distance_m")
+# 
+# train_data <- select_model_features(train_data, features_distance)
+# test_data  <- select_model_features(test_data, features_distance)
+```
+
+### Backward Elimination
+
+Backward elimination was selected as the primary feature selection method due to its ability to evaluate predictors in the context of the full model. Starting with all available features ensures that interactions and combined effects between variables are considered, which is particularly important in complex datasets where individual predictors may only be informative when used together. The method iteratively removes variables based on the Akaike Information Criterion (AIC), balancing model fit and complexity, and thus helping to prevent overfitting while maintaining predictive performance.
+
+However, backward elimination does not explicitly address multicollinearity, which can lead to unstable coefficient estimates in regression models. Therefore, an additional feature selection step based on the Variance Inflation Factor (VIF) is applied for linear and polynomial regression models. This allows the removal of highly collinear predictors, improving model interpretability and stability.
+
+### Linear Regression
+
+Linear regression was chosen as the initial modeling approach due to its high interpretability and simplicity. As a baseline model, it provides a clear understanding of the relationships between predictors and the target variable through easily interpretable coefficients. This makes it a useful reference point for evaluating more complex models, allowing us to assess whether additional complexity leads to meaningful improvements in predictive performance.
+
+#### Train/Test Split & Folds
+
+```{r}
+split <- create_train_test_split(timetable_transformed, seed = SEED)
+
+train_data <- split$train
+test_data  <- split$test
+
+folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
+```
+
+#### Checking Relationships
 
 We are going to check the relationships between some of the most useful predictors and target. For the sake of performance, we are going to limit the total size of the dataset. For the sake of clarity, we are going to use binned scatterplots that:
 
@@ -1371,7 +1564,7 @@ This approach notably limits the total number of points in the plot and improves
 If both lines significantly overlap, it indicates linear relationship.
 
 ```{r}
-sample_data <- timetable_transformed %>%
+sample_data <- train_data %>%
   slice_sample(n = 5000)
 
 train_col_names <- colnames(sample_data)
@@ -1404,90 +1597,7 @@ patchwork::wrap_plots(binned_plot_list, ncol = 2, guides = "collect") &
 
 Several predictors—especially interaction terms—demonstrate clear non-linear relationships with the target, indicating that linear models alone may be insufficient and that incorporating non-linear transformations or more flexible models is justified.
 
-### Train/Test Split
-
-```{r}
-# ===
-# 12.1 Train / test split
-# ===
-
-set.seed(42)
-
-# 1. Vyber 80% trip_id (nie riadkov)
-unique_trips <- unique(timetable_transformed$trip_id)
-train_trips <- sample(unique_trips, size = 0.8 * length(unique_trips))
-
-# 2. Filter podla trip_id - cely trip ide bud do trainu, alebo do testu
-train_data <- timetable_transformed %>%
-  filter(trip_id %in% train_trips)
-
-test_data <- timetable_transformed %>%
-  filter(!trip_id %in% train_trips)
-
-# 3. Sanity check - ziadny trip nesmie byt v oboch
-shared_trips <- intersect(unique(train_data$trip_id), unique(test_data$trip_id))
-stopifnot(length(shared_trips) == 0)
-
-cat("Train trips:", length(unique(train_data$trip_id)), 
-    "| Test trips:", length(unique(test_data$trip_id)), "\n")
-cat("Train rows:", nrow(train_data), 
-    "| Test rows:", nrow(test_data), "\n")
-
-# 4. Az teraz dropnut trip_id - v modeli ho nechces
-train_data <- train_data %>% select(-trip_id)
-test_data  <- test_data  %>% select(-trip_id)
-
-glimpse(train_data)
-
-
-```
-
-#### Frequency Encoding
-
-```{r}
-freq_cols <- c(
-  "route_short_name",
-  "route_id",
-  "trip_headsign",
-  "stop_name",
-  "stop_code"
-)
-
-glimpse(train_data)
-
-for (col in freq_cols) {
-  freq_table <- fit_frequency_encoding(train_data, col)
-  
-  train_data <- apply_frequency_encoding(train_data, freq_table, col)
-  test_data  <- apply_frequency_encoding(test_data, freq_table, col)
-}
-```
-
-#### Folds
-
-```{r}
-set.seed(42)
-folds <- vfold_cv(train_data, v = 5)
-```
-
-### Keep-only Features (for testing)
-
-```{r}
-features_distance <- c("segment_distance_m")
-
-train_data <- select_model_features(train_data, features_distance)
-test_data  <- select_model_features(test_data, features_distance)
-```
-
-### Backward Elimination
-
-Backward elimination was selected as the primary feature selection method due to its ability to evaluate predictors in the context of the full model. Starting with all available features ensures that interactions and combined effects between variables are considered, which is particularly important in complex datasets where individual predictors may only be informative when used together. The method iteratively removes variables based on the Akaike Information Criterion (AIC), balancing model fit and complexity, and thus helping to prevent overfitting while maintaining predictive performance.
-
-However, backward elimination does not explicitly address multicollinearity, which can lead to unstable coefficient estimates in regression models. Therefore, an additional feature selection step based on the Variance Inflation Factor (VIF) is applied for linear and polynomial regression models. This allows the removal of highly collinear predictors, improving model interpretability and stability.
-
-### Linear Regression
-
-#### Correlated Features
+#### Feature Selection
 
 The features listed in `high_vif_features` were identified through an iterative process. First, a regression model was fitted using backward elimination based on the AIC criterion. Subsequently, the Variance Inflation Factor (VIF) was computed to assess multicollinearity among the remaining predictors. Features exhibiting high VIF values were then removed, and the model was refitted. This process was repeated until an acceptable level of multicollinearity was achieved.
 
@@ -1536,37 +1646,7 @@ lm_step <- step(
 final_lm_formula <- formula(lm_step)
 final_lm_formula
 
-summary(lm_model)
-```
-
-#### Train Data Evaluation
-
-```{r}
-
-cv_linear <- purrr::map_dfr(folds$splits, function(split) {
-  train_fold <- rsample::analysis(split)
-  valid_fold <- rsample::assessment(split)
-  
-  model <- lm(final_lm_formula, data = train_fold)
-  
-  preds <- predict(model, newdata = valid_fold)
-  
-  evaluate_regression(
-    actual = valid_fold$segment_time_s,
-    predicted = preds,
-    model_name = "Linear Regression backward CV"
-  )
-})
-
-cv_linear_summary <- cv_linear %>%
-  summarise(
-    RMSE = mean(RMSE),
-    MAE = mean(MAE),
-    R2 = mean(R2)
-  ) %>%
-  mutate(model = "Linear Regression backward CV")
-
-cv_linear_summary
+summary(lm_step)
 ```
 
 #### VIF
@@ -1575,7 +1655,25 @@ The Variance Inflation Factor (VIF) analysis indicates that **multicollinearity 
 
 ```{r}
 
-vif(lm_model)
+# results <- vif(lm_step)
+
+vif_values <- vif(lm_step)
+
+vif_df <- format_vif(vif_values)
+
+vif_df
+
+# importance_rf <- rf_final$variable.importance
+# # importance_rf
+# importance_rf_df <- data.frame(
+#   feature = names(importance_rf),
+#   importance = importance_rf
+# ) %>%
+#   dplyr::arrange(desc(importance))
+# 
+# importance_rf_df
+
+
 ```
 
 #### Homoscedasticity
@@ -1583,7 +1681,7 @@ vif(lm_model)
 The scale-location plots reveal that the linear regression model exhibits clear heteroscedasticity, particularly for higher fitted values, where the variance of residuals increases substantially. This indicates that the model fails to adequately capture the underlying structure of the data.
 
 ```{r}
-plot_scale_location(lm_model$fitted.values, lm_model$residuals)
+plot_scale_location(lm_step$fitted.values, lm_step$residuals)
 ```
 
 #### Evaluation
@@ -1593,15 +1691,29 @@ The linear regression model achieved an RMSE of 31.68 and MAE of 23.61, indicati
 ```
 
 ```{r}
-predictions_lm <- predict(lm_model, newdata = test_data)
+predict_lm <- function(model, new_data) {
+  predict(model, newdata = new_data)
+}
 
-results_lm <- evaluate_regression(
-  actual = test_data$segment_time_s,
-  predicted = predictions_lm,
-  model_name = "Linear Regression"
+results_lm <- eval_train_test(
+  lm_step,
+  "Linear Regression",
+  train_data,
+  test_data,
+  predict_fun = predict_lm
 )
 
 results_lm
+
+# predictions_lm <- predict(lm_model, newdata = test_data)
+# 
+# results_lm <- evaluate_regression(
+#   actual = test_data$segment_time_s,
+#   predicted = predictions_lm,
+#   model_name = "Linear Regression"
+# )
+# 
+# results_lm
 ```
 
 #### Predicted vs. Actual
@@ -1616,6 +1728,19 @@ plot_predicted_vs_actual(
 ```
 
 ### Polynomial Regression
+
+Polynomial regression was introduced to capture potential nonlinear relationships between the predictors and the target variable. During exploratory data analysis, scatterplots comparing the target with selected predictors revealed curved patterns, indicating that a simple linear relationship may be insufficient. By incorporating polynomial terms, the model is able to better approximate these nonlinear trends while still retaining a relatively interpretable structure compared to more complex machine learning models.
+
+#### Train/Test Split & Folds
+
+```{r}
+split <- create_train_test_split(timetable_transformed, seed = SEED)
+
+train_data <- split$train
+test_data  <- split$test
+
+folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
+```
 
 #### Feature Selection
 
@@ -1692,41 +1817,18 @@ summary(lm_poly)
 # length(coef(lm_poly)) - 1
 ```
 
-#### Training Data Evaluation
-
-```{r}
-cv_poly <- purrr::map_dfr(folds$splits, function(split) {
-  train_fold <- rsample::analysis(split)
-  valid_fold <- rsample::assessment(split)
-  
-  model <- lm(poly_final_formula, data = train_fold)
-  
-  preds <- predict(model, newdata = valid_fold)
-  
-  evaluate_regression(
-    actual = valid_fold$segment_time_s,
-    predicted = preds,
-    model_name = "Polynomial Regression backward CV"
-  )
-})
-
-cv_poly_summary <- cv_poly %>%
-  summarise(
-    RMSE = mean(RMSE),
-    MAE = mean(MAE),
-    R2 = mean(R2)
-  ) %>%
-  mutate(model = "Polynomial Regression backward CV")
-
-cv_poly_summary
-```
-
 #### Variance Inflation Factor
 
 Most predictors show **very low multicollinearity**. The only standout is the *segment_distance_m*. We kept this predictor, however, because it has the strongest relationship with target and dropping it would cause the drop in R2 of about 5 percent.
 
 ```{r}
 vif(lm_poly)
+
+# vif_poly_values <- vif(lm_poly)
+# 
+# vif_poly_df <- format_vif(vif_poly_values)
+# 
+# vif_poly_df
 ```
 
 #### Homoscedasticity
@@ -1746,15 +1848,30 @@ plot_scale_location(lm_poly$fitted.values, lm_poly$residuals)
 The polynomial regression model achieved an RMSE of 29.46 and MAE of 21.62, indicating that the average prediction error remains in the range of approximately 20–30 seconds. Compared to linear baselines, the model shows a notable improvement in explanatory power, reaching an R² of 0.489, which means that nearly 49% of the variance in segment travel time is captured. This improvement suggests that incorporating non-linear transformations allows the model to better represent underlying relationships in the data. However, the relatively moderate reduction in absolute error highlights the presence of inherent variability and noise in real-world transport data, which limits further gains in prediction accuracy within the linear modeling framework.
 
 ```{r}
-predictions_lm_poly <- predict(lm_poly, newdata = test_data)
 
-results_lm_poly <- evaluate_regression(
-  actual = test_data$segment_time_s,
-  predicted = predictions_lm_poly,
-  model_name = "Polynomial Regression"
+predict_lm <- function(model, new_data) {
+  predict(model, newdata = new_data)
+}
+
+results_lm_poly <- eval_train_test(
+  lm_poly,
+  "Polynomial Regression",
+  train_data,
+  test_data,
+  predict_fun = predict_lm
 )
 
 results_lm_poly
+
+# predictions_lm_poly <- predict(lm_poly, newdata = test_data)
+# 
+# results_lm_poly <- evaluate_regression(
+#   actual = test_data$segment_time_s,
+#   predicted = predictions_lm_poly,
+#   model_name = "Polynomial Regression"
+# )
+# 
+# results_lm_poly
 # predictions_lm <- round(predictions_lm / 15) * 15
 ```
 
@@ -1771,28 +1888,51 @@ plot_predicted_vs_actual(
 
 ### Lasso Regression
 
-Lasso regression was selected as an embedded feature selection method due to its ability to simultaneously perform model fitting and variable selection. By introducing an L1 regularization penalty, Lasso shrinks regression coefficients and forces some of them to become exactly zero, effectively removing less important predictors from the model. This is particularly useful in datasets with a large number of features or potential multicollinearity, as it produces a more compact and interpretable model while helping to prevent overfitting.
+Lasso regression was selected as an embedded feature selection method due to its ability to simultaneously perform model fitting and variable selection. By introducing an L1 regularization penalty, Lasso shrinks regression coefficients and forces some of them to become exactly zero, effectively removing less important predictors from the model. In previous linear and polynomial regression models, feature reduction was performed using a combination of backward elimination and VIF analysis, which required more manual intervention to address multicollinearity. Therefore, Lasso was included to evaluate how effectively an automated regularization-based approach can handle feature selection and correlated predictors, while producing a more compact and potentially more stable model.
+
+#### Train/Test Split
+
+```{r}
+split <- create_train_test_split(timetable_transformed, seed = SEED)
+
+train_data <- split$train
+test_data  <- split$test
+
+# non_numeric_cols <- names(train_data)[
+#   !sapply(train_data, is.numeric)
+# ]
+# 
+# non_numeric_cols
+```
 
 #### Model Fit
 
 Prior to training the Lasso model, the dataset was transformed into a suitable format required by the glmnet package. Subsequently, 5-fold cross-validation was applied to determine the optimal regularization parameter (λ), enabling a balance between model complexity and predictive performance.
 
 ```{r}
-feature_names <- setdiff(names(train_data), TARGET)
+# feature_names <- setdiff(names(train_data), TARGET)
 # feature_names
 
-x_train <- as.matrix(train_data[, feature_names])
-y_train <- train_data[[TARGET]]
+# x_train <- as.matrix(train_data[, feature_names])
+# y_train <- train_data[[TARGET]]
+# 
+# x_test <- as.matrix(test_data[, feature_names])
+# y_test <- test_data[[TARGET]]
 
-x_test <- as.matrix(test_data[, feature_names])
-y_test <- test_data[[TARGET]]
+glmnet_data <- prepare_glmnet_data(train_data, test_data, TARGET)
+
+x_train <- glmnet_data$x_train
+y_train <- glmnet_data$y_train
+
+x_test <- glmnet_data$x_test
+y_test <- glmnet_data$y_test
 
 
 cv_lasso <- cv.glmnet(
   x_train,
   y_train,
   alpha = 1,        # LASSO
-  nfolds = 5 # splitting into training data into 5 parts
+  nfolds = CV_N_FOLDS # splitting into training data into 5 parts
 )
 ```
 
@@ -1834,11 +1974,21 @@ Here we can list the remaining predictors that has not been dropped by lasso mod
 ```{r}
 
 selected_features <- rownames(coef_lasso)[coef_lasso[,1] != 0]
-selected_features
-
 selected_features <- selected_features[selected_features != "(Intercept)"]
 
 selected_features
+```
+
+#### Comparing with Feature Selection with LR
+
+```{r}
+vif_df <- vif_df %>%
+  dplyr::mutate(
+    selected_by_lasso = feature %in% selected_features
+  )
+
+vif_df %>%
+  dplyr::arrange(desc(vif))
 ```
 
 #### Evaluation
@@ -1847,20 +1997,54 @@ Lasso regression achieved performance comparable to linear regression with backw
 
 ```{r}
 
-pred_train_lasso <- predict(lasso_model, newx = x_train)
-pred_test_lasso  <- predict(lasso_model, newx = x_test)
+# pred_train_lasso <- predict(lasso_model, newx = x_train)
+# pred_test_lasso  <- predict(lasso_model, newx = x_test)
+# 
+# results_lasso <- dplyr::bind_rows(
+#   evaluate_regression(
+#     actual = y_train,
+#     predicted = pred_train_lasso,
+#     model_name = "Lasso train"
+#   ),
+#   evaluate_regression(
+#     actual = y_test,
+#     predicted = pred_test_lasso,
+#     model_name = "Lasso test"
+#   )
+# )
+# 
+# results_lasso
 
-results_lasso <- dplyr::bind_rows(
-  evaluate_regression(
-    actual = y_train,
-    predicted = pred_train_lasso,
-    model_name = "Lasso train"
-  ),
-  evaluate_regression(
-    actual = y_test,
-    predicted = pred_test_lasso,
-    model_name = "Lasso test"
-  )
+
+predict_glmnet <- function(model, x) {
+  as.vector(predict(model, newx = x))
+}
+
+# eval_train_test_glmnet <- function(model, model_label, x_train, y_train, x_test, y_test) {
+#   pred_train <- as.vector(predict(model, newx = x_train))
+#   pred_test  <- as.vector(predict(model, newx = x_test))
+#   
+#   dplyr::bind_rows(
+#     evaluate_regression(
+#       actual = y_train,
+#       predicted = pred_train,
+#       model_name = paste0(model_label, " train")
+#     ),
+#     evaluate_regression(
+#       actual = y_test,
+#       predicted = pred_test,
+#       model_name = paste0(model_label, " test")
+#     )
+#   )
+# }
+
+results_lasso <- eval_train_test_glmnet(
+  lasso_model,
+  "Lasso",
+  x_train,
+  y_train,
+  x_test,
+  y_test
 )
 
 results_lasso
@@ -1870,18 +2054,35 @@ results_lasso
 
 Elastic Net regression was applied as a second embedded feature selection method. It combines the L1 penalty of Lasso, which can shrink coefficients to zero, with the L2 penalty of Ridge, which stabilizes coefficient estimates in the presence of correlated predictors. This makes Elastic Net suitable for this dataset, where several time-related and route-related variables may be correlated. The value `alpha = 0.5` was used to balance both penalties, and `lambda.1se` was selected to obtain a simpler model with stronger regularization.
 
+#### Train/Test Split
+
+```{r}
+split <- create_train_test_split(timetable_transformed, seed = SEED)
+
+train_data <- split$train
+test_data  <- split$test
+```
+
 #### Model Fit
 
 ```{r}
 
 # Elastic Net: alpha between 0 and 1
-set.seed(42)
+# set.seed(42)
+
+glmnet_data <- prepare_glmnet_data(train_data, test_data, TARGET)
+
+x_train <- glmnet_data$x_train
+y_train <- glmnet_data$y_train
+
+x_test <- glmnet_data$x_test
+y_test <- glmnet_data$y_test
 
 cv_elastic <- cv.glmnet(
   x_train,
   y_train,
   alpha = 0.5,
-  nfolds = 5
+  nfolds = CV_N_FOLDS
 )
 
 # best_lambda_elastic_1se <- cv_elastic$lambda.1se
@@ -1916,29 +2117,293 @@ selected_features_elastic
 length(selected_features_elastic)
 ```
 
+#### Comparing Feature Selection with LR
+
+```{r}
+vif_df <- vif_df %>%
+  dplyr::mutate(
+    selected_by_lasso = feature %in% selected_features_elastic
+  )
+
+vif_df %>%
+  dplyr::arrange(desc(vif))
+```
+
+#### Evaluation
+
 ```{r}
 
-pred_train_elastic <- predict(elastic_model, newx = x_train)
-pred_test_elastic  <- predict(elastic_model, newx = x_test)
+predict_glmnet <- function(model, x) {
+  as.vector(predict(model, newx = x))
+}
 
-results_elastic <- dplyr::bind_rows(
-  evaluate_regression(
-    actual = y_train,
-    predicted = pred_train_elastic,
-    model_name = "Elastic Net train"
-  ),
-  evaluate_regression(
-    actual = y_test,
-    predicted = pred_test_elastic,
-    model_name = "Elastic Net test"
-  )
+# eval_train_test_glmnet <- function(model, model_label, x_train, y_train, x_test, y_test) {
+#   pred_train <- as.vector(predict(model, newx = x_train))
+#   pred_test  <- as.vector(predict(model, newx = x_test))
+#   
+#   dplyr::bind_rows(
+#     evaluate_regression(
+#       actual = y_train,
+#       predicted = pred_train,
+#       model_name = paste0(model_label, " train")
+#     ),
+#     evaluate_regression(
+#       actual = y_test,
+#       predicted = pred_test,
+#       model_name = paste0(model_label, " test")
+#     )
+#   )
+# }
+
+results_elastic <- eval_train_test_glmnet(
+  elastic_model,
+  "Elastic Net",
+  x_train,
+  y_train,
+  x_test,
+  y_test
 )
 
 results_elastic
+# 
+# results_elastic <- eval_train_test(
+#   elastic_model,
+#   "Elastic Net",
+#   train_data = x_train,
+#   test_data = x_test,
+#   predict_fun = predict_glmnet
+# )
+# 
+# pred_train_elastic <- predict(elastic_model, newx = x_train)
+# pred_test_elastic  <- predict(elastic_model, newx = x_test)
+# 
+# results_elastic <- dplyr::bind_rows(
+#   evaluate_regression(
+#     actual = y_train,
+#     predicted = pred_train_elastic,
+#     model_name = "Elastic Net train"
+#   ),
+#   evaluate_regression(
+#     actual = y_test,
+#     predicted = pred_test_elastic,
+#     model_name = "Elastic Net test"
+#   )
+# )
+# 
+# results_elastic
 
 ```
 
+### Tuning & Validation Setup
+
+#### Validation Dataset
+
+```{r}
+
+set.seed(42)
+
+val_ids <- sample(seq_len(nrow(train_data)), size = 0.2 * nrow(train_data))
+
+validation_data <- train_data[val_ids, ]
+train_inner <- train_data[-val_ids, ]
+```
+
+#### Tuning Function
+
+```{r}
+run_validation_grid <- function(grid, fit_fun, predict_fun, train_inner, validation_data) {
+  results <- list()
+
+  for (i in seq_len(nrow(grid))) {
+    params <- grid[i, ]
+
+    model <- fit_fun(train_inner, params)
+
+    preds <- predict_fun(model, validation_data)
+
+    res <- evaluate_regression(
+      actual = validation_data$segment_time_s,
+      predicted = preds,
+      model_name = paste(names(params), params, collapse = " | ")
+    ) %>%
+      dplyr::bind_cols(params)
+
+    results[[i]] <- res
+  }
+
+  dplyr::bind_rows(results)
+}
+```
+
+#### Cross-Validation Function
+
+```{r}
+run_cv <- function(folds, fit_fun, predict_fun, params, model_name) {
+  cv_results <- purrr::map_dfr(folds$splits, function(split) {
+    train_fold <- rsample::analysis(split)
+    valid_fold <- rsample::assessment(split)
+
+    model <- fit_fun(train_fold, params = params)
+    preds <- predict_fun(model, valid_fold)
+
+    evaluate_regression(
+      actual = valid_fold$segment_time_s,
+      predicted = preds,
+      model_name = paste(model_name, "CV fold")
+    )
+  })
+
+  cv_results %>%
+    dplyr::summarise(
+      RMSE = mean(RMSE),
+      MAE  = mean(MAE),
+      R2   = mean(R2)
+    ) %>%
+    dplyr::mutate(model = paste(model_name, "(CV)")) %>%
+    dplyr::select(model, RMSE, MAE, R2)
+}
+```
+
+### Decision Tree
+
+#### Train/Test Split & Folds
+
+```{r}
+split <- create_train_test_split(timetable_transformed, seed = SEED)
+
+train_data <- split$train
+test_data  <- split$test
+
+
+folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
+```
+
+#### Hyperparameter Tuning
+
+```{r}
+
+# set.seed(42)
+# 
+# val_ids <- sample(seq_len(nrow(train_data)), size = 0.2 * nrow(train_data))
+# 
+# validation_data <- train_data[val_ids, ]
+# train_inner <- train_data[-val_ids, ]
+
+```
+
+##### Grid
+
+```{r}
+dt_grid <- expand.grid(
+  maxdepth = c(3, 5, 7, 10),
+  minsplit = c(10, 20),
+  cp = c(0.001, 0.01)
+)
+```
+
+##### Tuning
+
+```{r}
+fit_dt <- function(data, params) {
+  # importance_type <- if (compute_importance) "impurity" else "none"
+
+  rpart(
+    segment_time_s ~ .,
+    data = data,
+    method = "anova",
+    control = rpart.control(
+      maxdepth = params$maxdepth,
+      minsplit = params$minsplit,
+      cp = params$cp
+    )
+    # importance = importance_type
+  )
+}
+
+predict_rpart <- function(model, new_data) {
+  predict(model, newdata = new_data)
+}
+
+dt_validation_results <- run_validation_grid(
+  grid = dt_grid,
+  fit_fun = fit_dt,
+  predict_fun = predict_rpart,
+  train_inner = train_inner,
+  validation_data = validation_data
+)
+
+dt_validation_results
+```
+
+##### Choosing Best Params
+
+```{r}
+best_dt_params <- dt_validation_results %>%
+  dplyr::arrange(RMSE) %>%
+  dplyr::slice(1)
+
+# best_maxdepth = best_dt_params %>% pull(maxdepth)
+# best_minsplit = best_dt_params %>% pull(minsplit)
+# best_cp = best_dt_params %>% pull(cp)
+
+best_dt_params
+```
+
+#### Cross-Validation
+
+```{r}
+cv_dt_summary <- run_cv(
+  folds = folds,
+  fit_fun = fit_dt,
+  predict_fun = predict_rpart,
+  params = best_dt_params,
+  model_name = "Decision Tree"
+)
+
+cv_dt_summary
+```
+
+#### Model Fit
+
+```{r}
+dt_final <- fit_dt(train_data, best_dt_params)
+
+```
+
+#### Evaluation
+
+```{r}
+
+results_dt <- eval_train_test(dt_final, "DT", train_data, test_data, predict_fun = predict_rpart)
+results_dt
+```
+
+#### Feature Importance
+
+```{r}
+importance_dt <- dt_final$variable.importance
+importance_dt_df <- data.frame(
+  feature = names(importance_dt),
+  importance = importance_dt
+) %>%
+  dplyr::arrange(desc(importance))
+
+importance_dt_df
+```
+
 ### Random Forest
+
+#### Train/Test Split & Folds
+
+```{r}
+split <- create_train_test_split(timetable_transformed, seed = SEED)
+
+train_data <- split$train
+test_data  <- split$test
+
+
+folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
+```
 
 Random Forest was selected as an additional modeling approach due to its ability to capture complex non-linear relationships and interactions between predictors without requiring explicit feature engineering. Furthermore, Random Forest is robust to multicollinearity and less sensitive to outliers, while also providing an inherent measure of feature importance. These properties make it a strong candidate for comparison with simpler statistical models.
 
@@ -1951,121 +2416,163 @@ The results show a substantial improvement when increasing \`mtry\` from 3 to 5.
 ##### Validation Dataset
 
 ```{r}
-set.seed(42)
-
-val_ids <- sample(seq_len(nrow(train_data)), size = 0.2 * nrow(train_data))
-
-validation_data <- train_data[val_ids, ]
-train_inner <- train_data[-val_ids, ]
+# set.seed(42)
+# 
+# val_ids <- sample(seq_len(nrow(train_data)), size = 0.2 * nrow(train_data))
+# 
+# validation_data <- train_data[val_ids, ]
+# train_inner <- train_data[-val_ids, ]
 ```
 
 ##### Dynamic Grid
 
 ```{r}
-p <- ncol(train_inner) - 1  # minus target
-p
-
-mtry_values <- unique(c(
-  3,
-  floor(sqrt(p)),
-  floor(p / 4)
-))
-
-mtry_values
-
-grid <- expand.grid(
-  mtry = mtry_values,
+# p <- ncol(train_inner) - 1  # minus target
+# p
+# 
+# mtry_values <- unique(c(
+#   3,
+#   floor(sqrt(p)),
+#   floor(p / 4)
+# ))
+# 
+# mtry_values
+# 
+# # grid <- expand.grid(
+# #   mtry = mtry_values,
+# #   min.node.size = c(5, 10)
+# # )
+rf_grid <- expand.grid(
+  mtry = c(3, 6, 9),
   min.node.size = c(5, 10)
 )
 
 ```
 
-```{r}
-results <- list()
+##### Tuning
 
-for (i in 1:nrow(grid)) {
-  m <- grid$mtry[i]
-  node <- grid$min.node.size[i]
-  
-  model <- ranger(
+```{r}
+# results <- list()
+# 
+# for (i in 1:nrow(grid)) {
+#   m <- grid$mtry[i]
+#   node <- grid$min.node.size[i]
+#   
+#   model <- ranger(
+#     segment_time_s ~ .,
+#     data = train_inner,
+#     num.trees = 200,
+#     mtry = m,
+#     min.node.size = node,
+#     seed = 42
+#   )
+#   
+#   preds <- predict(model, data = validation_data)$predictions
+#   
+#   res <- evaluate_regression(
+#     actual = validation_data$segment_time_s,
+#     predicted = preds,
+#     model_name = paste("RF mtry =", m, "| node =", node)
+#   ) %>%
+#     dplyr::mutate(mtry = m, min.node.size = node)
+#   
+#   results[[i]] <- res
+# }
+# 
+# validation_results <- dplyr::bind_rows(results)
+# validation_results
+fit_rf <- function(data, params, compute_importance = FALSE) {
+  importance_type <- if (compute_importance) "impurity" else "none"
+
+  ranger(
     segment_time_s ~ .,
-    data = train_inner,
+    data = data,
     num.trees = 200,
-    mtry = m,
-    min.node.size = node,
+    mtry = params$mtry,
+    min.node.size = params$min.node.size,
+    importance = importance_type,
     seed = 42
   )
-  
-  preds <- predict(model, data = validation_data)$predictions
-  
-  res <- evaluate_regression(
-    actual = validation_data$segment_time_s,
-    predicted = preds,
-    model_name = paste("RF mtry =", m, "| node =", node)
-  ) %>%
-    dplyr::mutate(mtry = m, min.node.size = node)
-  
-  results[[i]] <- res
 }
 
-validation_results <- dplyr::bind_rows(results)
-validation_results
+predict_ranger <- function(model, new_data) {
+  predict(model, data = new_data)$predictions
+}
+
+rf_validation_results <- run_validation_grid(
+  grid = rf_grid,
+  fit_fun = fit_rf,
+  predict_fun = predict_ranger,
+  train_inner = train_inner,
+  validation_data = validation_data
+)
+
+rf_validation_results
 ```
 
 ##### Choosing Best Params
 
 ```{r}
-best_params <- validation_results %>%
+best_rf_params <- rf_validation_results %>%
   dplyr::arrange(RMSE) %>%
   dplyr::slice(1)
 
-best_mtry <- best_params %>%
-  pull(mtry)
-       
-best_min_node_size <- best_params %>%
-  pull(min.node.size)
+# best_mtry <- best_rf_params %>%
+#   pull(mtry)
+#        
+# best_min_node_size <- best_rf_params %>%
+#   pull(min.node.size)
 
-best_params
+best_rf_params
 ```
 
 #### Cross Validation
 
 ```{r}
 
-fit_rf <- function(data, mtry, min_node_size, seed = 42) {
-  ranger(
-    segment_time_s ~ .,
-    data = data,
-    num.trees = 200,
-    mtry = mtry,
-    min.node.size = min_node_size,
-    importance = "impurity",
-    seed = seed
-  )
-}
+# fit_rf <- function(data, mtry, min_node_size, seed = 42) {
+#   ranger(
+#     segment_time_s ~ .,
+#     data = data,
+#     num.trees = 200,
+#     mtry = mtry,
+#     min.node.size = min_node_size,
+#     importance = "impurity",
+#     seed = seed
+#   )
+# }
 
-cv_rf <- purrr::map_dfr(folds$splits, function(split) {
-  train_fold <- rsample::analysis(split)
-  valid_fold <- rsample::assessment(split)
-  
-  model <- fit_rf(train_fold, mtry = best_mtry, min_node_size = best_min_node_size)
-  preds <- predict(model, data = valid_fold)$predictions
-  
-  evaluate_regression(
-    actual = valid_fold$segment_time_s,
-    predicted = preds,
-    model_name = "RF (CV fold)"
-  )
-})
-
-cv_rf_summary <- cv_rf %>%
-  summarise(
-    RMSE = mean(RMSE),
-    MAE  = mean(MAE),
-    R2   = mean(R2)
-  ) %>%
-  mutate(model = "Random Forest (CV)") %>%
-  select(model, RMSE, MAE, R2)
+# cv_rf <- purrr::map_dfr(folds$splits, function(split) {
+#   train_fold <- rsample::analysis(split)
+#   valid_fold <- rsample::assessment(split)
+#   
+#   model <- fit_rf(train_fold, params = best_params)
+#   preds <- predict(model, data = valid_fold)$predictions
+#   
+#   evaluate_regression(
+#     actual = valid_fold$segment_time_s,
+#     predicted = preds,
+#     model_name = "RF (CV fold)"
+#   )
+# })
+# 
+# cv_rf_summary <- cv_rf %>%
+#   summarise(
+#     RMSE = mean(RMSE),
+#     MAE  = mean(MAE),
+#     R2   = mean(R2)
+#   ) %>%
+#   mutate(model = "Random Forest (CV)") %>%
+#   select(model, RMSE, MAE, R2)
+# 
+# cv_rf_summary
+cv_rf_summary <- run_cv(
+  folds = folds,
+  fit_fun = fit_rf,
+  predict_fun = predict_ranger,
+  params = best_rf_params,
+  model_name = "Random Forest"
+)
 
 cv_rf_summary
 ```
@@ -2080,9 +2587,9 @@ Overall, this configuration reflects a compromise between efficiency and predict
 
 ```{r}
 
-rf_final <- fit_rf(train_data, mtry = best_mtry, min_node_size = best_min_node_size)
-
-summary(rf_final)
+# rf_final <- fit_rf(train_data, mtry = best_mtry, min_node_size = best_min_node_size)
+rf_final <- fit_rf(train_data, params = best_rf_params, compute_importance = TRUE)
+# summary(rf_final)
 ```
 
 #### Evaluation
@@ -2091,23 +2598,26 @@ The Random Forest model was evaluated on both training and test datasets to asse
 To verify generalization, the model was evaluated on unseen test data, where it achieved an RMSE of 12.13 and an R² of 0.913. Although there is a noticeable decrease in performance compared to the training results, the model still maintains high predictive accuracy. This gap between training and test performance indicates a moderate level of overfitting, which is expected for flexible models such as Random Forest, but does not significantly impair its ability to generalize.
 
 ```{r}
-pred_train_rf <- predict(rf_best, data = train_data)$predictions
-pred_test_rf  <- predict(rf_best, data = test_data)$predictions
+# pred_train_rf <- predict(rf_final, data = train_data)$predictions
+# pred_test_rf  <- predict(rf_final, data = test_data)$predictions
 
-results_rf <- dplyr::bind_rows(
-  evaluate_regression(
-    actual = train_data$segment_time_s,
-    predicted = pred_train_rf,
-    model_name = "Random Forest train"
-  ),
-  evaluate_regression(
-    actual = test_data$segment_time_s,
-    predicted = pred_test_rf,
-    model_name = "Random Forest test"
-  )
-)
-
+results_rf <- eval_train_test(rf_final, "RF", train_data, test_data, predict_fun = predict_ranger)
 results_rf
+
+# results_rf <- dplyr::bind_rows(
+#   evaluate_regression(
+#     actual = train_data$segment_time_s,
+#     predicted = pred_train_rf,
+#     model_name = "Random Forest train"
+#   ),
+#   evaluate_regression(
+#     actual = test_data$segment_time_s,
+#     predicted = pred_test_rf,
+#     model_name = "Random Forest test"
+#   )
+# )
+# 
+# results_rf
 ```
 
 #### Feature Importance
@@ -2115,25 +2625,181 @@ results_rf
 The feature importance analysis derived from the Random Forest model highlights **segment_distance_m** as the most influential predictor by a substantial margin, indicating that travel time is primarily driven by the physical distance between stops. This is consistent with domain expectations. Among the remaining predictors, spatial features such as **stop_lon** and **stop_lat** also exhibit strong importance, suggesting that location-specific factors contribute significantly to travel time variability. Engineered interaction features (**distance_sin_interaction** and **distance_cos_interaction**) rank highly as well, confirming that incorporating temporal patterns into distance-based measures enhances predictive power. Additionally, frequency-encoded categorical variables, including **stop_name_freq**, **route_short_name_freq**, and **trip_headsign_freq**, provide meaningful signal, likely capturing route-specific and operational characteristics.
 
 ```{r}
-importance <- rf_best$variable.importance
-
-importance_df <- data.frame(
-  feature = names(importance),
-  importance = importance
+importance_rf <- rf_final$variable.importance
+# importance_rf
+importance_rf_df <- data.frame(
+  feature = names(importance_rf),
+  importance = importance_rf
 ) %>%
   dplyr::arrange(desc(importance))
 
-importance_df
+importance_rf_df
 
-importance_df %>%
-  head(15) %>%
-  ggplot(aes(x = reorder(feature, importance), y = importance)) +
-  geom_col(fill = "steelblue") +
+
+
+```
+
+### Tree Comparison
+
+#### Feature Importance Combined
+
+```{r}
+importance_rf_df <- importance_rf_df %>%
+  mutate(model = "Random Forest")
+
+importance_dt_df <- importance_dt_df %>%
+  mutate(model = "Decision Tree")
+
+importance_combined <- dplyr::bind_rows(
+  importance_rf_df,
+  importance_dt_df
+)
+
+importance_combined %>%
+  dplyr::group_by(model) %>%
+  dplyr::slice_max(importance, n = 10) %>%
+  ggplot(aes(x = reorder(feature, importance), y = importance, fill = model)) +
+  geom_col(show.legend = FALSE) +
   coord_flip() +
-  theme_minimal() +
-  labs(
-    title = "Feature Importance (Random Forest - ranger)",
-    x = "Feature",
-    y = "Importance"
+  facet_wrap(~model, scales = "free") +
+  theme_minimal()
+```
+
+## Conclusion
+
+### Regression Models vs. Tree-based Models
+
+#### Informative Features
+
+In this section we analyze features that were used during final fitting of all models (LR, PR, LR and RF).
+
+```{r}
+extract_lm_features <- function(model, model_name) {
+  terms_used <- attr(terms(model), "term.labels")
+  
+  tibble::tibble(
+    model = model_name,
+    feature = terms_used
   )
+}
+
+extract_tree_features <- function(importance_values, model_name) {
+  tibble::tibble(
+    model = model_name,
+    feature = names(importance_values),
+    importance = as.numeric(importance_values)
+  ) %>%
+    dplyr::arrange(desc(importance))
+}
+```
+
+Was feature retained by model? This condition is expressed as boolean flag in the following table:
+
+```{r}
+features_lr <- extract_lm_features(lm_step, "Linear Regression")
+features_pr <- extract_lm_features(lm_poly, "Polynomial Regression")
+
+features_dt <- extract_tree_features(
+  dt_final$variable.importance,
+  "Decision Tree"
+)
+
+features_rf <- extract_tree_features(
+  rf_final$variable.importance,
+  "Random Forest"
+)
+
+all_model_features <- dplyr::bind_rows(
+  features_lr,
+  features_pr,
+  features_dt %>% select(model, feature),
+  features_rf %>% select(model, feature)
+)
+
+feature_presence <- all_model_features %>%
+  mutate(present = TRUE) %>%
+  pivot_wider(
+    names_from = model,
+    values_from = present,
+    values_fill = FALSE
+  )
+
+feature_presence
+```
+
+#### Features Common to Both Families
+
+Now we want to analyze which features were retained by regression model families and also by tree-based families.
+
+```{r}
+regression_features <- bind_rows(features_lr, features_pr) %>%
+  pull(feature) %>%
+  unique()
+
+tree_features <- bind_rows(
+  features_dt,
+  features_rf
+) %>%
+  pull(feature) %>%
+  unique()
+
+common_features <- intersect(regression_features, tree_features)
+
+common_features
+```
+
+#### Other benefits and drawbacks
+
+The evaluated models highlight a clear trade-off between interpretability and predictive performance. Linear regression offers the highest level of interpretability, as the relationship between predictors and the target variable is directly expressed through model coefficients. This makes it easy to understand the direction and magnitude of each feature’s effect, but its simplicity limits its ability to capture complex patterns, resulting in weaker predictive performance. Polynomial regression extends this approach by incorporating nonlinear terms, improving performance while still retaining partial interpretability, although the presence of higher-order terms makes direct interpretation more difficult.
+
+Decision trees represent a different approach based on feature-space partitioning, where the model splits the data into regions using hierarchical rules. This provides intuitive, rule-based interpretability, as predictions can be traced through decision paths. However, single trees are often unstable and sensitive to small changes in the data. Random Forest further extends this idea by combining multiple trees, significantly improving predictive performance and robustness. As a result, it achieved the best performance among the evaluated models. However, this comes at the cost of reduced interpretability, as the ensemble structure makes it difficult to directly explain individual predictions, relying instead on aggregate measures such as feature importance.
+
+### Algorithmic vs. Feature-Selection Methods
+
+```{r}
+
+n_features_backward <- length(coef(lm_step)) - 1
+
+n_features_lasso <- sum(coef(lasso_model) != 0) - 1
+
+n_features_elastic <- sum(coef(elastic_model) != 0) - 1
+
+selection_summary <- tibble::tibble(
+  model = c("Linear Regression (Backward)", "Lasso Regression", "Elastic Net"),
+  selection_type = c("Algorithmic / wrapper", "Embedded", "Embedded"),
+  retained_features = c(
+    n_features_backward,
+    n_features_lasso,
+    n_features_elastic
+  )
+)
+
+selection_summary
+```
+
+#### Feature Overlap
+
+In the table below we show whether a feature was retained in the final model by using a specific technique. This condition is demonstrated by boolean flag. Features that are by most of the methods are listed at the top.
+
+```{r}
+features_backward <- names(coef(lm_step))[-1]
+
+features_lasso <- rownames(coef(lasso_model))[coef(lasso_model)[, 1] != 0]
+features_lasso <- features_lasso[features_lasso != "(Intercept)"]
+
+features_elastic <- rownames(coef(elastic_model))[coef(elastic_model)[, 1] != 0]
+features_elastic <- features_elastic[features_elastic != "(Intercept)"]
+
+feature_selection_table <- tibble::tibble(
+  feature = unique(c(features_backward, features_lasso, features_elastic))
+) %>%
+  dplyr::mutate(
+    backward = feature %in% features_backward,
+    lasso = feature %in% features_lasso,
+    elastic_net = feature %in% features_elastic,
+    selected_count = backward + lasso + elastic_net
+  ) %>%
+  dplyr::arrange(desc(selected_count), feature)
+
+feature_selection_table
 ```
