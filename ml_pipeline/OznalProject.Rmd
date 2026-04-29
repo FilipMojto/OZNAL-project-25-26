@@ -94,6 +94,7 @@ library("car")
 library("randomForest")
 library("ranger")
 library("glmnet") # for lasso regression
+library("rsample") # for cv
 
 # install.packages("glmnet")
 ```
@@ -1179,6 +1180,15 @@ evaluate_regression <- function(actual, predicted, round_to = NULL, model_name =
   )
 }
 
+# explicitly used in cv
+eval_metrics <- function(actual, predicted) {
+  tibble(
+    RMSE = sqrt(mean((actual - predicted)^2)),
+    MAE = mean(abs(actual - predicted)),
+    R2 = cor(actual, predicted)^2
+  )
+}
+
 plot_predicted_vs_actual <- function(
   data,
   predictions,
@@ -1432,7 +1442,7 @@ glimpse(train_data)
 
 ```
 
-### Frequency Encoding
+#### Frequency Encoding
 
 ```{r}
 freq_cols <- c(
@@ -1451,8 +1461,13 @@ for (col in freq_cols) {
   train_data <- apply_frequency_encoding(train_data, freq_table, col)
   test_data  <- apply_frequency_encoding(test_data, freq_table, col)
 }
+```
 
-train_data$route_short_name_freq
+#### Folds
+
+```{r}
+set.seed(42)
+folds <- vfold_cv(train_data, v = 5)
 ```
 
 ### Keep-only Features (for testing)
@@ -1512,11 +1527,14 @@ test_data <- drop_cols_report(test_data, high_vif_features)
 # summary(lm_model)
 lm_model <- lm(segment_time_s ~ ., data = train_data)
 
-lm_model <- step(
+lm_step <- step(
   lm_model,
   direction = "backward",
-  trace = TRUE
+  trace = FALSE
 )
+
+final_lm_formula <- formula(lm_step)
+final_lm_formula
 
 summary(lm_model)
 ```
@@ -1524,15 +1542,31 @@ summary(lm_model)
 #### Train Data Evaluation
 
 ```{r}
-predictions_lm <- predict(lm_model, newdata = train_data)
 
-results_lm <- evaluate_regression(
-  actual = train_data$segment_time_s,
-  predicted = predictions_lm,
-  model_name = "Linear Regression"
-)
+cv_linear <- purrr::map_dfr(folds$splits, function(split) {
+  train_fold <- rsample::analysis(split)
+  valid_fold <- rsample::assessment(split)
+  
+  model <- lm(final_lm_formula, data = train_fold)
+  
+  preds <- predict(model, newdata = valid_fold)
+  
+  evaluate_regression(
+    actual = valid_fold$segment_time_s,
+    predicted = preds,
+    model_name = "Linear Regression backward CV"
+  )
+})
 
-results_lm
+cv_linear_summary <- cv_linear %>%
+  summarise(
+    RMSE = mean(RMSE),
+    MAE = mean(MAE),
+    R2 = mean(R2)
+  ) %>%
+  mutate(model = "Linear Regression backward CV")
+
+cv_linear_summary
 ```
 
 #### VIF
@@ -1641,7 +1675,10 @@ lm_poly <- lm(
   data = train_data
 )
 
-lm_poly <- step(lm_poly, direction = "backward")
+lm_poly <- step(lm_poly, direction = "backward", trace = FALSE)
+
+poly_final_formula <- formula(lm_poly)
+poly_final_formula
 ```
 
 #### Evaluating Predictors
@@ -1652,22 +1689,36 @@ We can see that the polynomial terms now have more significant compared to their
 
 ```{r}
 summary(lm_poly)
-length(coef(lm_poly)) - 1
+# length(coef(lm_poly)) - 1
 ```
 
 #### Training Data Evaluation
 
 ```{r}
-predictions_lm_poly <- predict(lm_poly, newdata = train_data)
+cv_poly <- purrr::map_dfr(folds$splits, function(split) {
+  train_fold <- rsample::analysis(split)
+  valid_fold <- rsample::assessment(split)
+  
+  model <- lm(poly_final_formula, data = train_fold)
+  
+  preds <- predict(model, newdata = valid_fold)
+  
+  evaluate_regression(
+    actual = valid_fold$segment_time_s,
+    predicted = preds,
+    model_name = "Polynomial Regression backward CV"
+  )
+})
 
+cv_poly_summary <- cv_poly %>%
+  summarise(
+    RMSE = mean(RMSE),
+    MAE = mean(MAE),
+    R2 = mean(R2)
+  ) %>%
+  mutate(model = "Polynomial Regression backward CV")
 
-results_lm_poly <- evaluate_regression(
-  actual = train_data$segment_time_s,
-  predicted = predictions_lm_poly,
-  model_name = "Polynomial Regression"
-)
-
-results_lm_poly
+cv_poly_summary
 ```
 
 #### Variance Inflation Factor
@@ -1908,40 +1959,40 @@ validation_data <- train_data[val_ids, ]
 train_inner <- train_data[-val_ids, ]
 ```
 
-```{r}
-# results <- list()
-# 
-# for (m in c(3, 5)) {
-#   model <- randomForest(
-#     segment_time_s ~ .,
-#     data = train_data,
-#     ntree = 200,
-#     mtry = m,
-#     nodesize = 10
-#   )
-#   
-#   preds <- predict(model, test_data)
-#   
-#   res <- evaluate_regression(
-#     actual = test_data$segment_time_s,
-#     predicted = preds,
-#     model_name = paste("RF mtry =", m)
-#   )
-#   
-#   results[[as.character(m)]] <- res
-# }
-# 
-# dplyr::bind_rows(results)
-results <- list()
-models <- list()
+##### Dynamic Grid
 
-for (m in c(3, 5)) {
+```{r}
+p <- ncol(train_inner) - 1  # minus target
+p
+
+mtry_values <- unique(c(
+  3,
+  floor(sqrt(p)),
+  floor(p / 4)
+))
+
+mtry_values
+
+grid <- expand.grid(
+  mtry = mtry_values,
+  min.node.size = c(5, 10)
+)
+
+```
+
+```{r}
+results <- list()
+
+for (i in 1:nrow(grid)) {
+  m <- grid$mtry[i]
+  node <- grid$min.node.size[i]
+  
   model <- ranger(
     segment_time_s ~ .,
     data = train_inner,
     num.trees = 200,
     mtry = m,
-    min.node.size = 10,
+    min.node.size = node,
     seed = 42
   )
   
@@ -1950,11 +2001,11 @@ for (m in c(3, 5)) {
   res <- evaluate_regression(
     actual = validation_data$segment_time_s,
     predicted = preds,
-    model_name = paste("RF validation mtry =", m)
-  )
+    model_name = paste("RF mtry =", m, "| node =", node)
+  ) %>%
+    dplyr::mutate(mtry = m, min.node.size = node)
   
-  results[[as.character(m)]] <- res
-  models[[as.character(m)]] <- model
+  results[[i]] <- res
 }
 
 validation_results <- dplyr::bind_rows(results)
@@ -1964,12 +2015,59 @@ validation_results
 ##### Choosing Best Params
 
 ```{r}
-best_mtry <- validation_results %>%
+best_params <- validation_results %>%
   dplyr::arrange(RMSE) %>%
-  dplyr::slice(1) %>%
-  dplyr::pull(model)
+  dplyr::slice(1)
 
-best_mtry
+best_mtry <- best_params %>%
+  pull(mtry)
+       
+best_min_node_size <- best_params %>%
+  pull(min.node.size)
+
+best_params
+```
+
+#### Cross Validation
+
+```{r}
+
+fit_rf <- function(data, mtry, min_node_size, seed = 42) {
+  ranger(
+    segment_time_s ~ .,
+    data = data,
+    num.trees = 200,
+    mtry = mtry,
+    min.node.size = min_node_size,
+    importance = "impurity",
+    seed = seed
+  )
+}
+
+cv_rf <- purrr::map_dfr(folds$splits, function(split) {
+  train_fold <- rsample::analysis(split)
+  valid_fold <- rsample::assessment(split)
+  
+  model <- fit_rf(train_fold, mtry = best_mtry, min_node_size = best_min_node_size)
+  preds <- predict(model, data = valid_fold)$predictions
+  
+  evaluate_regression(
+    actual = valid_fold$segment_time_s,
+    predicted = preds,
+    model_name = "RF (CV fold)"
+  )
+})
+
+cv_rf_summary <- cv_rf %>%
+  summarise(
+    RMSE = mean(RMSE),
+    MAE  = mean(MAE),
+    R2   = mean(R2)
+  ) %>%
+  mutate(model = "Random Forest (CV)") %>%
+  select(model, RMSE, MAE, R2)
+
+cv_rf_summary
 ```
 
 #### Model Fit
@@ -1981,16 +2079,10 @@ To control model complexity and reduce overfitting, the minimum node size was se
 Overall, this configuration reflects a compromise between efficiency and predictive accuracy, leveraging the strengths of Random Forest while maintaining reasonable computational cost.
 
 ```{r}
-rf_best <- ranger(
-  segment_time_s ~ .,
-  data = train_data,
-  num.trees = 100,
-  mtry = 5,
-  min.node.size = 10,
-  importance = "impurity",
-  seed = 42
-)
 
+rf_final <- fit_rf(train_data, mtry = best_mtry, min_node_size = best_min_node_size)
+
+summary(rf_final)
 ```
 
 #### Evaluation
