@@ -3,6 +3,8 @@ title: "OznalProject"
 output: html_document
 ---
 
+Link to datasets at various stages of preprocessing: https://drive.google.com/drive/folders/1-LXpMd02jxtsiNFtAF6JWPKVPCoyB5_O?usp=sharing
+
 # Predicting Travel Time of Bratislava MHD
 
 ## Selecting Data
@@ -191,23 +193,16 @@ drop_cols_report <- function(data, cols_to_drop, label = NULL) {
 }
 
 drop_rows_report <- function(data, rows_to_drop) {
-  # 1. Store initial count
   row_num_before <- nrow(data)
-  
-  # 2. Perform the drop
-  # Using -rows_to_drop handles the removal by index.
-  # We check if rows_to_drop is empty first to avoid returning an empty table.
   if (length(rows_to_drop) > 0) {
     data_reduced <- data[-rows_to_drop, ]
   } else {
     data_reduced <- data
   }
   
-  # 3. Calculate difference
   row_num_after <- nrow(data_reduced)
   dropped_count <- row_num_before - row_num_after
   
-  # 4. Print the report
   message(paste0("Dropped rows: ", dropped_count, 
                  " - Current size: ", row_num_after))
   
@@ -217,7 +212,7 @@ drop_rows_report <- function(data, rows_to_drop) {
 find_duplicate_columns <- function(df) {
   is_dup <- duplicated(as.list(df))
   
-  dup_summary <- tibble::tibble(
+  dup_summary <- tibble(
     column = names(df),
     is_duplicate = is_dup
   )
@@ -242,11 +237,11 @@ one_hot_encode <- function(data, col) {
   
   # remove intercept column
   mm <- mm %>%
-    dplyr::select(-`(Intercept)`)
+    select(-`(Intercept)`)
   
   data %>%
-    dplyr::bind_cols(mm) %>%
-    dplyr::select(-all_of(col))
+    bind_cols(mm) %>%
+    select(-all_of(col))
 }
 
 # =========================================================
@@ -314,9 +309,6 @@ In the code below, we create a summary of missing values for every columns using
 2. **High-missing features** (missing_pct ≥ 50): These features are potentially problematic, as the large proportion of missing values may reduce their reliability. Such features are typically removed
 
 ```{r}
-# 1. Missing values
-# =========================
-
 missing_summary <- timetable %>%
   summarise(across(everything(), ~ sum(is.na(.)))) %>%
   pivot_longer(cols = everything(), names_to = "column", values_to = "missing_count") %>%
@@ -325,6 +317,8 @@ missing_summary <- timetable %>%
   arrange(desc(missing_pct))
 
 missing_summary
+
+high_missing <- missing_summary %>% filter(missing_pct >= 50) %>% pull(column)
 ```
 
 #### Constant & Near-Constant Features
@@ -332,9 +326,6 @@ missing_summary
 These are features that carry no or only minimal signal and would only cause model to overfit they should be dropped too.
 
 ```{r}
-# =========================
-# 2. Constant & Near-Constant features
-# =========================
 variance_summary <- timetable %>%
   summarise(across(everything(), ~ n_distinct(.))) %>%
   pivot_longer(cols = everything(), names_to = "column", values_to = "n_unique") %>%
@@ -345,10 +336,6 @@ variance_summary
 ##### Constant Features
 
 ```{r}
-# ===
-# 2.1 Constant features (should be dropped immediately)
-# ===
-
 constant_features <- variance_summary %>%
   filter(n_unique == 1) %>% pull(column)
 
@@ -399,9 +386,6 @@ print(paste("Duplicate row count:", length(dup_row_indexes)))
 The function `find_duplicate_columns` identifies duplicate columns by treating the dataset as a list of column vectors and applying the `duplicated()` function. This approach detects columns that have identical values to a previously encountered column.  It also includes edge cases such as columns containing only missing values (e.g., all `NA`), which are also considered duplicates if more than one such column exists.
 
 ```{r}
-# More efficient check for duplicate columns
-# R looks at the "top level" of the data frame. duplicated() now looks at each 
-# vector (column) as a single item in a list and compares them.
 dup_cols <- find_duplicate_columns(timetable)
 
 paste("Duplicate cols")
@@ -501,9 +485,6 @@ glimpse(timetable_encoded)
 #### Saving Dataset
 
 ```{r}
-# =========================
-# 10. Save dataset
-# =========================
 saveRDS(timetable_encoded, "./datasets/timetable_encoded.rds")
 ```
 
@@ -541,63 +522,52 @@ select_correlated_features <- function(
     top_n = NULL,
     always_keep = NULL
 ) {
-  # keep only numeric columns for correlation
   numeric_data <- data %>%
-    dplyr::select(where(is.numeric))
+    select(where(is.numeric))
   
-  # check target exists
   if (!(target_col %in% names(numeric_data))) {
     stop(paste("Target column", target_col, "must exist and be numeric."))
   }
   
-  # compute correlations with target
   cor_vec <- cor(numeric_data, use = "complete.obs")[, target_col]
   
   cor_df <- data.frame(
     feature = names(cor_vec),
     correlation = as.numeric(cor_vec)
   ) %>%
-    dplyr::filter(feature != target_col) %>%
-    dplyr::mutate(abs_correlation = abs(correlation)) %>%
-    dplyr::arrange(desc(abs_correlation))
+    filter(feature != target_col) %>%
+    mutate(abs_correlation = abs(correlation)) %>%
+    arrange(desc(abs_correlation))
   
-  # threshold filter
   cor_df <- cor_df %>%
-    dplyr::filter(abs_correlation >= min_abs_cor)
+    filter(abs_correlation >= min_abs_cor)
   
-  # optional top_n restriction
   if (!is.null(top_n)) {
     cor_df <- cor_df %>%
-      dplyr::slice_head(n = top_n)
+      slice_head(n = top_n)
   }
   
-  # final feature list
   selected_features <- unique(c(
     target_col,
     cor_df$feature,
     always_keep
   ))
   
-  # keep only existing columns (safe)
   selected_features <- intersect(selected_features, names(data))
   
   return(data %>%
-           dplyr::select(all_of(selected_features)))
+           select(all_of(selected_features)))
 }
 
 plot_correlation_heatmap <- function(df, threshold = 0.3, title = "Correlation Heatmap") {
   
-  # 1. Calculate correlation matrix (only for numeric columns)
-  # It's safer to filter for numeric variables automatically
   cor_matrix <- df %>%
     select(where(is.numeric)) %>%
     cor(use = "complete.obs")
   
-  # 2. Convert to long format
   cor_long <- as.data.frame(as.table(cor_matrix))
   colnames(cor_long) <- c("Var1", "Var2", "Correlation")
   
-  # 3. Create the plot
   ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
     geom_tile() +
     # Dynamic label filtering based on the 'threshold' argument
@@ -607,11 +577,11 @@ plot_correlation_heatmap <- function(df, threshold = 0.3, title = "Correlation H
       color = "black"
     ) +
     scale_fill_gradient2(
-      low = "#377eb8",  # Nice blue
+      low = "#377eb8", 
       mid = "white",
-      high = "#e41a1c", # Nice red
+      high = "#e41a1c",
       midpoint = 0,
-      limit = c(-1, 1)   # Ensures the scale is always centered
+      limit = c(-1, 1)  
     ) +
     theme_minimal() +
     theme(
@@ -626,7 +596,6 @@ plot_hist_dist <- function(df, var_name, bins = 30, show_density = FALSE) {
   p <- ggplot(df, aes(x = !!sym(var_name)))
   
   if (show_density) {
-    # If density is requested, we must map the y-axis to density
     p <- p + geom_histogram(
       aes(y = after_stat(density)),
       fill = "steelblue", 
@@ -636,7 +605,6 @@ plot_hist_dist <- function(df, var_name, bins = 30, show_density = FALSE) {
     ) +
     geom_density(color = "darkblue", linewidth = 1)
   } else {
-    # Standard count-based histogram
     p <- p + geom_histogram(
       fill = "steelblue", 
       color = "white", 
@@ -655,13 +623,12 @@ plot_hist_dist <- function(df, var_name, bins = 30, show_density = FALSE) {
 
 plot_box_dist <- function(df, var_name) {
   ggplot(df, aes(x = !!sym(var_name))) +
-    # Adding a dummy y-axis value or a factor(0) helps boxplot orientation
     geom_boxplot(fill = "lightblue", outlier.color = "red", outlier.alpha = 0.5) +
     coord_flip() +
     theme_minimal() +
     labs(
       title = paste(var_name),
-      x = NULL # Removing x label as the title covers it
+      x = NULL 
     )
 }
 
@@ -673,36 +640,28 @@ plot_predictor_boxplots <- function(
     title = "Outlier Detection Across Predictors",
     subtitle = "Boxplots identifying potential outliers in red"
 ) {
-  # Identify binary columns
-  is_binary <- purrr::map_lgl(df, ~ length(unique(stats::na.omit(.x))) <= 2)
+  is_binary <- map_lgl(df, ~ length(unique(na.omit(.x))) <= 2)
   binary_cols <- names(is_binary[is_binary])
   
-  # Select predictors to plot
   predictors_to_plot <- setdiff(names(df), c(target_col, binary_cols))
   
-  # Optional message
   if (show_message) {
     message("Dropping binary features: ", paste(binary_cols, collapse = ", "))
   }
   
-  # Create individual plots
-  plot_list <- purrr::map(predictors_to_plot, ~ plot_box_dist(df, .x))
+  plot_list <- map(predictors_to_plot, ~ plot_box_dist(df, .x))
   
-  # Combine plots
-  combined_plot <- patchwork::wrap_plots(plot_list, ncol = ncol) +
-    patchwork::plot_annotation(
+  combined_plot <- wrap_plots(plot_list, ncol = ncol) +
+    plot_annotation(
       title = title,
       subtitle = subtitle,
-      theme = ggplot2::theme(
-        plot.title = ggplot2::element_text(size = 18, face = "bold")
+      theme = theme(
+        plot.title = element_text(size = 18, face = "bold")
       )
     )
   
   return(combined_plot)
 }
-
-# --- Engineering --- #
-
 
 add_engineered_features <- function(df){
   df_engineered <- df %>%
@@ -822,17 +781,6 @@ saveRDS(timetable_engineered, './datasets/timetable_engineered.rds')
 ### Utility Functions
 
 ```{r}
-# ---- ALTERNATIVE (LESS VISUALLY APPEALING) ----
-# plot_homoscedasticity_plot <- function(fitted, residuals){
-#   data.frame(
-#     fitted = fitted,
-#     residuals = residuals
-#   ) %>%
-#     ggplot(aes(x = fitted, y = residuals)) +
-#     geom_point(alpha = 0.2) +
-#     geom_hline(yintercept = 0, color = "red") +
-#     theme_minimal()
-# }
 plot_homoscedasticity_plot <- function(fitted, residuals){
   data.frame(
     fitted = fitted,
@@ -886,39 +834,6 @@ plot_scale_location <- function(fitted, residuals){
     )
 }
 
-# --- ALTERNATIVE TO BINNED RELATIONSHIP PLOT ---
-# plot_scatterplot_line <- function(data, x, y = "segment_time_s") {
-#   ggplot(data, aes(x = .data[[x]], y = .data[[y]])) +
-#     geom_point(alpha = 0.08, size = 0.6) +
-#     geom_smooth(method = "lm", color = "red", se = FALSE, linewidth = 0.8) +
-#     geom_smooth(
-#       method = "gam",
-#       formula = y ~ s(x, k = 5),
-#       color = "blue",
-#       se = FALSE,
-#       linewidth = 0.9
-#     ) +
-#     theme_minimal() +
-#     labs(
-#       title = x,
-#       x = x,
-#       y = y
-#     ) +
-#     theme(
-#       plot.title = element_text(size = 10, face = "bold"),
-#       axis.text = element_text(size = 8),
-#       axis.title = element_text(size = 8)
-#     )
-# }
-# scatterplot_list <- purrr::map(
-#   features_to_check,
-#   ~ plot_scatterplot_line(sample_data, .x)
-# )
-# 
-# combined_plot <- patchwork::wrap_plots(scatterplot_list, ncol = 2)
-# 
-# combined_plot
-
 plot_binned_relationship <- function(data, x, y = "segment_time_s", bins = 30, 
                                      label_size = 12, text_size = 10) {
   data %>%
@@ -939,7 +854,7 @@ plot_binned_relationship <- function(data, x, y = "segment_time_s", bins = 30,
       se = FALSE
     ) +
     scale_color_manual(
-      name = "Legend", # This name must be identical across all plots
+      name = "Legend", 
       values = c("Linear" = "red", "Non-linear" = "blue")
     ) +
     theme_minimal() +
@@ -949,8 +864,6 @@ plot_binned_relationship <- function(data, x, y = "segment_time_s", bins = 30,
     ) +
     labs(x = x, y = paste("Mean", y))
 }
-
-# ---- Evaluation ---- #
 
 evaluate_regression <- function(actual, predicted, round_to = NULL, model_name = "model") {
   if (!is.null(round_to)) {
@@ -964,7 +877,7 @@ evaluate_regression <- function(actual, predicted, round_to = NULL, model_name =
   ss_res   <- sum((actual - predicted)^2, na.rm = TRUE)
   r2 <- 1 - (ss_res / ss_total)
   
-  tibble::tibble(
+  tibble(
     model = model_name,
     RMSE = rmse,
     MAE = mae,
@@ -972,7 +885,6 @@ evaluate_regression <- function(actual, predicted, round_to = NULL, model_name =
   )
 }
 
-# explicitly used in cv
 eval_metrics <- function(actual, predicted) {
   tibble(
     RMSE = sqrt(mean((actual - predicted)^2)),
@@ -981,12 +893,11 @@ eval_metrics <- function(actual, predicted) {
   )
 }
 
-# used for LR, PR, DT, RF
 eval_train_test <- function(model, model_label, train_data, test_data, predict_fun) {
   pred_train <- predict_fun(model, train_data)
   pred_test  <- predict_fun(model, test_data)
   
-  dplyr::bind_rows(
+  bind_rows(
     evaluate_regression(
       actual = train_data$segment_time_s,
       predicted = pred_train,
@@ -1000,12 +911,11 @@ eval_train_test <- function(model, model_label, train_data, test_data, predict_f
   )
 }
 
-# used for LASSO/ElASTIC
 eval_train_test_glmnet <- function(model, model_label, x_train, y_train, x_test, y_test) {
   pred_train <- as.vector(predict(model, newx = x_train))
   pred_test  <- as.vector(predict(model, newx = x_test))
   
-  dplyr::bind_rows(
+  bind_rows(
     evaluate_regression(
       actual = y_train,
       predicted = pred_train,
@@ -1031,7 +941,6 @@ plot_predicted_vs_actual <- function(
     predicted = predictions
   )
   
-  # Create perfect line data
   line_data <- data.frame(
     x = range(plot_data$actual)
   )
@@ -1041,7 +950,6 @@ plot_predicted_vs_actual <- function(
     
     geom_point(alpha = 0.25, size = 1, color = "steelblue") +
     
-    # Perfect prediction line (now mapped → legend works)
     geom_line(
       data = line_data,
       aes(x = x, y = y, color = "Perfect prediction"),
@@ -1093,11 +1001,8 @@ plot_qq <- function(residuals, title = "QQ Plot") {
     )
 }
 
-# ---- Feature Selection ---- #
-
 select_model_features <- function(data, features = NULL, target = "segment_time_s") {
   
-  # If NULL or empty → return full dataset
   if (is.null(features) || length(features) == 0) {
     return(data)
   }
@@ -1110,16 +1015,15 @@ select_model_features <- function(data, features = NULL, target = "segment_time_
   }
   
   data %>%
-    dplyr::select(dplyr::any_of(keep_cols))
+    select(any_of(keep_cols))
 }
 
-# ---- ENCODING ----- #
 
 fit_frequency_encoding <- function(train_df, col) {
   freq_col <- paste0(col, "_freq")
   
   freq_table <- train_df %>%
-    dplyr::count(.data[[col]])
+    count(.data[[col]])
   
   names(freq_table)[names(freq_table) == "n"] <- freq_col
   
@@ -1132,15 +1036,13 @@ apply_frequency_encoding <- function(df, freq_table, col) {
   freq_col <- paste0(col, "_freq")
   
   df %>%
-    dplyr::left_join(freq_table, by = col) %>%
-    dplyr::mutate(
+    left_join(freq_table, by = col) %>%
+    mutate(
       !!freq_col := ifelse(is.na(.data[[freq_col]]), 0, .data[[freq_col]])
     ) %>%
-    dplyr::select(-dplyr::all_of(col))
+    select(-all_of(col))
 }
 
-
-# ---- Lasso & Elastic Helpers ---- #
 
 prepare_glmnet_data <- function(train_data, test_data, target) {
   feature_names <- setdiff(names(train_data), target)
@@ -1160,16 +1062,52 @@ prepare_glmnet_data <- function(train_data, test_data, target) {
   )
 }
 
-# ---- VIF Helpers (LR, PR) ----
-
 format_vif <- function(vif_values) {
   data.frame(
     feature = names(vif_values),
     vif = as.numeric(vif_values)
   ) %>%
-    dplyr::arrange(desc(vif))
+    arrange(desc(vif))
 }
 ```
+#### Cross-Validation Function
+
+```{r}
+run_cv <- function(folds, fit_fun, predict_fun, params, model_name) {
+  
+  cv_results <- map_dfr(seq_along(folds$splits), function(i) {
+    split <- folds$splits[[i]]
+    
+    train_fold <- analysis(split)
+    valid_fold <- assessment(split)
+
+    model <- fit_fun(train_fold, params = params)
+    preds <- predict_fun(model, valid_fold)
+
+    evaluate_regression(
+      actual = valid_fold$segment_time_s,
+      predicted = preds,
+      model_name = paste(model_name, "fold", i)
+    ) %>%
+      mutate(fold = as.character(i))  
+  })
+
+  summary_row <- cv_results %>%
+    summarise(
+      RMSE = mean(RMSE),
+      MAE  = mean(MAE),
+      R2   = mean(R2)
+    ) %>%
+    mutate(
+      model = paste(model_name, "(CV mean)"),
+      fold = "mean"
+    )
+
+  bind_rows(cv_results, summary_row) %>%
+    select(model, fold, RMSE, MAE, R2)
+}
+```
+
 
 ### Loading Data
 
@@ -1229,18 +1167,15 @@ Finally, duplicate columns are identified and removed based on the training data
 create_train_test_split <- function(data, seed = 42, train_size = TRAIN_DF_PROPORTION) {
   set.seed(seed)
   
-  # 1. Vyber 80% trip_id (nie riadkov)
   unique_trips <- unique(data$trip_id)
   train_trips <- sample(unique_trips, size = train_size * length(unique_trips))
   
-  # 2. Filter podla trip_id - cely trip ide bud do trainu, alebo do testu
   train_data <- data %>%
     filter(trip_id %in% train_trips)
   
   test_data <- data %>%
     filter(!trip_id %in% train_trips)
   
-  # 3. Sanity check - ziadny trip nesmie byt v oboch
   shared_trips <- intersect(unique(train_data$trip_id), unique(test_data$trip_id))
   stopifnot(length(shared_trips) == 0)
   
@@ -1348,13 +1283,12 @@ features_to_check <- c(
 )
 
 # Note: Ensure TARGET is a string, e.g., TARGET <- "my_column_name"
-binned_plot_list <- purrr::map(
+binned_plot_list <- map(
   features_to_check,
   ~ plot_binned_relationship(sample_data, .x, y = TARGET, bins = 30, label_size = 8, text_size = 8)
 )
 
-# guides = "collect": Patchwork looks at all the plots. If it sees that they all have a legend named "Legend" with the same colors, it removes them from the individual plots and creates one single master legend.
-patchwork::wrap_plots(binned_plot_list, ncol = 2, guides = "collect") & 
+wrap_plots(binned_plot_list, ncol = 2, guides = "collect") & 
   theme(legend.position = "bottom")
 ```
 
@@ -1390,6 +1324,10 @@ fit_lm_backward <- function(data, params = NULL) {
   )
 }
 
+predict_lm <- function(model, new_data) {
+  predict(model, newdata = new_data)
+}
+
 cv_lm_summary <- run_cv(
   folds = folds,
   fit_fun = fit_lm_backward,
@@ -1406,8 +1344,6 @@ The cross-validation results for the backward-selected linear regression model i
 #### Model Fit
 
 ```{r}
-
-# lm_model <- lm(segment_time_s ~ ., data = train_data)
 lm_model <- fit_lm_backward(train_data)
 initial_vars <- attr(terms(lm_model), "term.labels")
 
@@ -1577,19 +1513,6 @@ To address this, second-degree polynomial transformations were introduced to cap
 Although other variables, such as *segment_distance_m* and *arrival_time_hour*, also showed non-linearity, they were found to be redundant given the presence of engineered features. This resulted in rank deficiency, with corresponding coefficients appearing as `NA` in the model output. Consequently, polynomial terms were not applied to these predictors, as they did not provide additional explanatory value.
 
 ```{r}
-# lm_poly <- lm(
-#   segment_time_s ~ 
-#     . -
-#     distance_sin_interaction -
-#     distance_cos_interaction -
-#     stop_lat -
-#     stop_lon +
-#     poly(distance_sin_interaction, 2) +
-#     poly(distance_cos_interaction, 2) +
-#     poly(stop_lat, 2) +
-#     poly(stop_lon, 2),
-#   data = train_data
-# )
 lm_poly <- fit_lm_poly_backward(train_data)
 
 initial_vars_poly <- attr(terms(lm_poly), "term.labels")
@@ -1709,14 +1632,9 @@ cv_lasso <- cv.glmnet(
 The optimal regularization parameter (λ) was selected using the `lambda.1se` criterion obtained from cross-validation. Unlike `lambda.min`, which yields the lowest prediction error, `lambda.1se` corresponds to the largest value of λ within one standard error of the minimum error. This results in a simpler and more regularized model, often with fewer retained features and improved generalization. Using this value, the final Lasso model was trained, allowing stronger penalization of coefficients and promoting sparsity in the resulting feature set.
 
 ```{r}
-# lambda controls how strongly coefficients are penalized:
-# small lambda → weaker penalty → more features retained
-# large lambda → stronger penalty → more coefficients shrink to zero
-# lambda.min is the value that gives the lowest cross-validation error.
 best_lambda_1se <- cv_lasso$lambda.1se
 best_lambda_1se
 
-# This fits the final Lasso model using the selected best lambda.
 lasso_model <- glmnet(
   x_train,
   y_train,
@@ -1800,7 +1718,6 @@ cv_elastic <- cv.glmnet(
 )
 
 best_lambda_elastic_1se <- cv_elastic$lambda.1se
-# best_lambda_elastic_1se <- cv_elastic$lambda.min
 best_lambda_elastic_1se
 ```
 
@@ -1890,53 +1807,14 @@ run_validation_grid <- function(grid, fit_fun, predict_fun, train_inner, validat
       predicted = preds,
       model_name = paste(names(params), params, collapse = " | ")
     ) %>%
-      dplyr::bind_cols(params)
+      bind_cols(params)
 
     results[[i]] <- res
   }
 
-  dplyr::bind_rows(results)
+  bind_rows(results)
 }
 ```
-
-#### Cross-Validation Function
-
-```{r}
-run_cv <- function(folds, fit_fun, predict_fun, params, model_name) {
-  
-  cv_results <- purrr::map_dfr(seq_along(folds$splits), function(i) {
-    split <- folds$splits[[i]]
-    
-    train_fold <- rsample::analysis(split)
-    valid_fold <- rsample::assessment(split)
-
-    model <- fit_fun(train_fold, params = params)
-    preds <- predict_fun(model, valid_fold)
-
-    evaluate_regression(
-      actual = valid_fold$segment_time_s,
-      predicted = preds,
-      model_name = paste(model_name, "fold", i)
-    ) %>%
-      mutate(fold = as.character(i))   # 👈 FIX HERE
-  })
-
-  summary_row <- cv_results %>%
-    summarise(
-      RMSE = mean(RMSE),
-      MAE  = mean(MAE),
-      R2   = mean(R2)
-    ) %>%
-    mutate(
-      model = paste(model_name, "(CV mean)"),
-      fold = "mean"
-    )
-
-  bind_rows(cv_results, summary_row) %>%
-    select(model, fold, RMSE, MAE, R2)
-}
-```
-
 ### Decision Tree
 
 
@@ -2017,8 +1895,8 @@ At the same time, varying the cp parameter has no observable impact on performan
 
 ```{r}
 best_dt_params <- dt_validation_results %>%
-  dplyr::arrange(RMSE) %>%
-  dplyr::slice(1)
+  arrange(RMSE) %>%
+  slice(1)
 
 best_dt_params
 ```
@@ -2068,7 +1946,7 @@ importance_dt_df <- data.frame(
   feature = names(importance_dt),
   importance = importance_dt
 ) %>%
-  dplyr::arrange(desc(importance))
+  arrange(desc(importance))
 
 importance_dt_df
 ```
@@ -2160,8 +2038,8 @@ This result suggests that the dataset benefits from more flexible models that ca
 
 ```{r}
 best_rf_params <- rf_validation_results %>%
-  dplyr::arrange(RMSE) %>%
-  dplyr::slice(1)
+  arrange(RMSE) %>%
+  slice(1)
 
 best_rf_params
 ```
@@ -2211,7 +2089,7 @@ importance_rf_df <- data.frame(
   feature = names(importance_rf),
   importance = importance_rf
 ) %>%
-  dplyr::arrange(desc(importance))
+  arrange(desc(importance))
 
 importance_rf_df
 ```
@@ -2231,20 +2109,6 @@ test_data  <- split$test
 folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
 ```
 
-#### Scaling
-
-```{r}
-
-summary(train_data$arrival_time_minute)
-
-train_scaled <- scale(train_data)
-test_scaled  <- scale(test_data)
-
-# summary(train_scaled$segment_distance_m)
-
-
-```
-
 #### Hyperparameter Tuning
 
 ##### Grid
@@ -2258,19 +2122,6 @@ svr_grid <- expand.grid(
 ```
 
 ##### Tuning
-
-```{r}
-dt_validation_results <- run_validation_grid(
-  grid = svr_grid,
-  fit_fun = fit_svr,
-  predict_fun = predict_svr,
-  train_inner = train_inner,
-  validation_data = validation_data
-)
-
-dt_validation_results
-```
-
 
 #### Fit
 
@@ -2313,9 +2164,6 @@ predict_svr <- function(model_obj, new_data) {
   predict(model_obj$model, newdata = x_new_scaled)
 }
 
-
-# svr_model <- fit_svr(train_scaled)
-
 ```
 
 #### Quick Fit
@@ -2325,15 +2173,12 @@ predict_svr <- function(model_obj, new_data) {
 glimpse(train_data)
 
 filtered_train <- train_data %>%
-  # select(all_of(c(TARGET, "segment_distance_m"))) %>%
   slice_sample(n = 15000)
 
 filtered_test <- test_data %>%
-  # select(all_of(c(TARGET, "segment_distance_m"))) %>%
   slice_sample(n = 15000)
 
 
-# glimpse(filtered_train)
 quick_params <- list(
   C = 1,
   gamma = 1 / (ncol(filtered_train) - 1),  # safe default
@@ -2442,19 +2287,19 @@ of the models that compose the following model families:
 extract_lm_features <- function(model, model_name) {
   terms_used <- attr(terms(model), "term.labels")
   
-  tibble::tibble(
+  tibble(
     model = model_name,
     feature = terms_used
   )
 }
 
 extract_tree_features <- function(importance_values, model_name) {
-  tibble::tibble(
+  tibble(
     model = model_name,
     feature = names(importance_values),
     importance = as.numeric(importance_values)
   ) %>%
-    dplyr::arrange(desc(importance))
+    arrange(desc(importance))
 }
 ```
 
@@ -2462,11 +2307,10 @@ Was feature retained by model? This condition is expressed as boolean flag in th
 
 ```{r}
 # --- Extract feature sets ---
-lr_features <- unique(features_lr$feature)
-pr_features <- unique(features_pr$feature)
-
-dt_features <- unique(features_dt$feature)
-rf_features <- unique(features_rf$feature)
+lr_features <- extract_lm_features(lm_step, "Linear Regression")$feature
+pr_features <- extract_lm_features(lm_poly, "Polynomial Regression")$feature
+dt_features <- extract_tree_features(dt_final$variable.importance, "DT")$feature
+rf_features <- extract_tree_features(rf_final$variable.importance, "RF")$feature
 
 # --- Create unified feature space ---
 all_features <- unique(c(
@@ -2509,9 +2353,8 @@ n_features_backward <- length(coef(lm_step)) - 1
 n_features_lasso <- sum(coef(lasso_model) != 0) - 1
 n_features_elastic <- sum(coef(elastic_model) != 0) - 1
 
-selection_summary <- tibble::tibble(
+selection_summary <- tibble(
   model = c("Linear Regression (Backward)", "Lasso Regression", "Elastic Net"),
-  # selection_type = c("Algorithmic / wrapper", "Embedded", "Embedded"),
   retained_features = c(
     n_features_backward,
     n_features_lasso,
@@ -2535,16 +2378,16 @@ features_lasso <- features_lasso[features_lasso != "(Intercept)"]
 features_elastic <- rownames(coef(elastic_model))[coef(elastic_model)[, 1] != 0]
 features_elastic <- features_elastic[features_elastic != "(Intercept)"]
 
-feature_selection_table <- tibble::tibble(
+feature_selection_table <- tibble(
   feature = unique(c(features_backward, features_lasso, features_elastic))
 ) %>%
-  dplyr::mutate(
+  mutate(
     backward = feature %in% features_backward,
     lasso = feature %in% features_lasso,
     elastic_net = feature %in% features_elastic,
     selected_count = backward + lasso + elastic_net
   ) %>%
-  dplyr::arrange(desc(selected_count), feature)
+  arrange(desc(selected_count), feature)
 
 feature_selection_table %>% select(-all_of(c('selected_count')))
 ```

@@ -1,14 +1,9 @@
-import os
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
-from dotenv import load_dotenv
-
 from config import DATASETS_DIR, INTERIM_DIR
-# DATASETS_DIR = "data/Datasets/"
 
-# load environment variable from .env file
 
 OUTPUT_FILE = INTERIM_DIR + "dataset.csv"
 
@@ -46,7 +41,6 @@ dataset = dataset.merge(agency, on="agency_id", how="left")
 print(f"Dataset: {len(dataset)} rows")
 
 
-# --- Segment time (seconds) ---
 def time_to_seconds(t):
     """Converts HH:MM:SS to seconds, supports times beyond 24h (e.g. 25:10:00)."""
     h, m, s = map(int, t.split(":"))
@@ -60,11 +54,9 @@ dataset["departure_seconds"] = dataset["departure_time"].apply(time_to_seconds)
 next_arrival = dataset.groupby("trip_id")["arrival_seconds"].shift(-1)
 dataset["segment_time_s"] = next_arrival - dataset["departure_seconds"]
 
-# lets print rows where segment_time_s == 0 or negative, which could indicate data issues or very short segments
 print("Rows with non-positive segment times:")
 print(dataset[dataset["segment_time_s"] <= 0][["trip_id", "stop_id", "arrival_time", "departure_time", "segment_time_s"]])
 
-# --- Segment distance (meters) via shape_dist_traveled from shapes.txt ---
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000
     phi1, phi2 = np.radians(lat1), np.radians(lat2)
@@ -83,13 +75,10 @@ shapes["d_prev"] = haversine(
     shapes.groupby("shape_id")["shape_pt_lon"].shift(1),
 )
 
-# duplicate but empty col, drop
-
 
 shapes["shape_dist_traveled"] = shapes.groupby("shape_id")["d_prev"].cumsum().fillna(0)
 
-# For each stop in a trip, find the nearest shape point and get its cumulative distance
-# shape_id is already in dataset from the trips merge above
+
 def get_shape_dist(group):
     """For each stop in a trip, find the nearest shape point by lat/lon and return its shape_dist_traveled."""
     shape_id = group["shape_id"].iloc[0]
@@ -116,18 +105,13 @@ dataset["segment_distance_m"] = next_shape_dist - dataset["stop_shape_dist"]
 dataset = dataset.drop("shape_dist_traveled", axis=1)
 dataset.rename(columns={"stop_shape_dist": "shape_dist_traveled"}, inplace=True)
 
-# --- Arrival time components ---
 arrival_parts = dataset["arrival_time"].str.split(":", expand=True).astype(int)
 dataset["arrival_time_hour"]   = arrival_parts[0] % 24   # normalize past-midnight hours
 dataset["arrival_time_minute"] = arrival_parts[1]
 dataset["arrival_time_second"] = arrival_parts[2]
 dataset["seconds_since_midnight"] = dataset["arrival_seconds"] % 86400
 
-# --- Day-type flags ---
-# dataset["is_weekday"]  = (dataset[["monday", "tuesday", "wednesday", "thursday", "friday"]].max(axis=1)).astype(int)
-# dataset["is_saturday"] = dataset["saturday"].astype(int)
-# dataset["is_sunday"]   = dataset["sunday"].astype(int)
-# updated to single categorical column instead of 3 binary flags
+
 dataset["day_type"] = np.select(
     [
         # runs all week
@@ -155,7 +139,6 @@ dataset["day_type"] = np.select(
     default="weekday"
 )
 
-# --- Time since last stop (seconds between prev departure and current arrival) ---
 prev_departure = dataset.groupby("trip_id")["departure_seconds"].shift(1)
 dataset["time_since_last_stop"] = dataset["arrival_seconds"] - prev_departure
 
@@ -163,8 +146,6 @@ print(f"Segment time nulls:     {dataset['segment_time_s'].isna().sum()} (last s
 print(f"Segment distance nulls: {dataset['segment_distance_m'].isna().sum()} (last stops in each trip)")
 print(f"Time since last nulls:  {dataset['time_since_last_stop'].isna().sum()} (first stops in each trip)")
 
-# --- data cleaning steps ---
-# dropping the last stops
 dataset = dataset[dataset["segment_time_s"].notna()]
 
 dataset.to_csv(OUTPUT_FILE, index=False)
