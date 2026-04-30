@@ -88,11 +88,11 @@ library("rsample") # for cv
 The following constants are defined to ensure consistency and reproducibility across the project. The variable *TARGET* specifies the response variable to be predicted, while *SEED* is used to control randomness in operations such as data splitting and model training. The constant *CV_N_FOLDS* determines the number of folds used in cross-validation, enabling a robust evaluation of model performance.
 
 ```{r}
-
 TARGET <- 'segment_time_s'
 SEED <- 42
 CV_N_FOLDS <- 5
 SLICE_SAMPLE = 0.1
+TRAIN_DF_PROPORTION = 0.8
 ```
 
 ## EDA
@@ -785,7 +785,6 @@ plot_correlation_heatmap(
     select(all_of(c(correlated_features, "segment_time_s"))) %>%
     select(-all_of(c(TARGET)))
 )
-
 ```
 
 #### Outliers
@@ -809,6 +808,8 @@ Based on the analysis of the predictors with most outliers and their distributio
 
 1.  *segment_distance_m* -\> very long tail, strong right skew, **log_transform** recommended
 2.  *distance_interactions* -\> also heavy tails, caused by distance metric. Log cannot be applied for negative values, so transforming distance and the recomputing is recommended
+
+Log transformation was applied to reduce skewness and stabilize variance, improving the suitability of predictors for linear modelling. Alternative transformations such as Box-Cox or Yeo-Johnson could also be considered; however, log transformation provides a simple and effective solution for positively skewed variables.
 
 ### Saving Data
 
@@ -1176,34 +1177,21 @@ The predictor `time_since_last_stop` was removed prior to model training, as it 
 
 ```{r}
 timetable <- readRDS("./datasets/timetable_engineered.rds")
-# glimpse(timetable)library("ranger")
 
-# glimpse(timetable)
 
 features_to_drop <- c('time_since_last_stop')
-
 timetable <- drop_cols_report(timetable, features_to_drop)
+
 ```
 
 ### Transformations
 
-In EDA we identified these predictors with highly skewed distributions:
+During exploratory data analysis, several predictors were identified as exhibiting highly skewed distributions, namely *segment_distance_m*, *distance_sin_interaction*, and *distance_cos_interaction*. To address this, a logarithmic transformation was applied selectively.
 
-1.  *segment_distance_m*
-2.  *distance_sin_interaction*
-3.  *distance_cos_interaction*
-
-We recommended applying **log transformation** only to the first feature because
-
-1.  the last 2 feature are calculated from it (dist \* sin_time, dist \* cos_time)
-2.  logarithmic transformations cannot be applied to negative values
-
-Thus after transfromation, we only recompute the remaning two features.
+The transformation was performed only on *segment_distance_m*, as the remaining two features are derived from it through interaction with cyclical time components (i.e., distance multiplied by sine and cosine transformations of time). Additionally, logarithmic transformation is not directly applicable to these derived features due to the presence of negative values. Instead, after transforming the base distance variable, the interaction features were recomputed, ensuring consistency while preserving their interpretability.
 
 ```{r}
-# plot_predictor_boxplots(train_data, target_col = 'segment_time_s')
 
-# summary(train_data %>% select(all_of(c('stop_lat', 'arrival_time_second', 'segment_distance_m'))))
 
 problematic_features <- c('segment_distance_m', 'distance_sin_interaction',
                           'distance_cos_interaction')
@@ -1216,33 +1204,34 @@ timetable_transformed <- timetable %>%
 timetable_transformed <- add_engineered_features(timetable_transformed)
 
 plot_predictor_boxplots(timetable_transformed %>% select(problematic_features), target_col = 'segment_time_s')
-
-# glimpse(timetable_transformed)
-
 ```
 
 From the box plots above it is clear that the skewness has been successfully eliminated for all the problematic features.
 
-Several predictors—especially interaction terms—demonstrate clear non-linear relationships with the target, indicating that linear models alone may be insufficient and that incorporating non-linear transformations or more flexible models is justified.
 
 ### Saving Training-Ready Data
 
 ```{r}
 saveRDS(timetable_transformed, './datasets/training_ready_data.rds')
-
-# timetable_transformed$route_id
 ```
 
-### Train/Test Split & Frequency Encoding
+### Train/Test Split, Frequency Encoding & Folds
+The function `create_train_test_split` is designed to prepare training and testing datasets in a consistent and reproducible manner and is applied uniformly across all models used in this study. The splitting procedure is performed at the *trip level* rather than on individual rows, ensuring that all observations belonging to a given trip are assigned exclusively to either the training or testing set. This approach prevents data leakage that could arise from having parts of the same trip present in both subsets.
+
+The function begins by randomly sampling a proportion of unique *trip_id* values (80% for training, 20% for testing), effectively performing a grouped sampling strategy that preserves the structural dependencies within trips. A sanity check is then conducted to verify that no trip appears in both subsets.
+
+Following the split, categorical variables are encoded using frequency encoding. Importantly, the encoding mappings are learned solely from the training data and subsequently applied to the test data, ensuring that no information from the test set influences the transformation process. This design choice further prevents data leakage and maintains the validity of model evaluation.
+
+Finally, duplicate columns are identified and removed based on the training data, and the same columns are consistently dropped from the test data to ensure alignment between both datasets. The function returns the processed training and testing sets, which are then used as inputs for all subsequent modelling approaches.
 
 ```{r}
 
-create_train_test_split <- function(data, seed = 42) {
+create_train_test_split <- function(data, seed = 42, train_size = TRAIN_DF_PROPORTION) {
   set.seed(seed)
   
   # 1. Vyber 80% trip_id (nie riadkov)
   unique_trips <- unique(data$trip_id)
-  train_trips <- sample(unique_trips, size = 0.8 * length(unique_trips))
+  train_trips <- sample(unique_trips, size = train_size * length(unique_trips))
   
   # 2. Filter podla trip_id - cely trip ide bud do trainu, alebo do testu
   train_data <- data %>%
@@ -1291,51 +1280,14 @@ create_train_test_split <- function(data, seed = 42) {
   list(train = train_data, test = test_data, dup_cols = dup_cols)
 }
 
-```
-
-#### Frequency Encoding
-
-```{r}
-# freq_cols <- c(
-#   "route_short_name",
-#   "route_id",
-#   "trip_headsign",
-#   "stop_name",
-#   "stop_code"
-# )
-# 
-# glimpse(train_data)
-# 
-# for (col in freq_cols) {
-#   freq_table <- fit_frequency_encoding(train_data, col)
-#   
-#   train_data <- apply_frequency_encoding(train_data, freq_table, col)
-#   test_data  <- apply_frequency_encoding(test_data, freq_table, col)
-# }
-```
-
-#### Folds
-
-```{r}
-# set.seed(42)
-
 create_folds <- function(train_data, v = CV_N_FOLD, seed = SEED){
   folds <- vfold_cv(train_data, v = v)
 }
 ```
 
-### Keep-only Features (for testing)
-
-```{r}
-# features_distance <- c("segment_distance_m")
-# 
-# train_data <- select_model_features(train_data, features_distance)
-# test_data  <- select_model_features(test_data, features_distance)
-```
-
 ### Backward Elimination
 
-Backward elimination was selected as the primary feature selection method due to its ability to evaluate predictors in the context of the full model. Starting with all available features ensures that interactions and combined effects between variables are considered, which is particularly important in complex datasets where individual predictors may only be informative when used together. The method iteratively removes variables based on the Akaike Information Criterion (AIC), balancing model fit and complexity, and thus helping to prevent overfitting while maintaining predictive performance.
+Backward elimination was selected as the primary feature selection method due to its ability to evaluate predictors in the context of the full model. The method starts with all features and iteratively removes variables based on the Akaike Information Criterion (AIC), balancing model fit and complexity, and thus helping to prevent overfitting while maintaining predictive performance.
 
 However, backward elimination does not explicitly address multicollinearity, which can lead to unstable coefficient estimates in regression models. Therefore, an additional feature selection step based on the Variance Inflation Factor (VIF) is applied for linear and polynomial regression models. This allows the removal of highly collinear predictors, improving model interpretability and stability.
 
@@ -1380,13 +1332,17 @@ train_col_names <- train_col_names[!train_col_names %in% c('segment_time_s')]
 
 length(train_col_names)
 
+colnames(sample_data)
+
 features_to_check <- c(
   "segment_distance_m",
   "distance_cos_interaction",
   "distance_sin_interaction",
-  "stop_name_freq",
-  "trip_headsign_freq",
-  "route_short_name_freq",
+  "arrival_seconds",
+  "arrival_time_hour",
+  "arrival_time_minute",
+  "arrival_time_second",
+  "seconds_since_midnight",
   "stop_lat",
   "stop_lon"
 )
@@ -1402,7 +1358,7 @@ patchwork::wrap_plots(binned_plot_list, ncol = 2, guides = "collect") &
   theme(legend.position = "bottom")
 ```
 
-Several predictors—especially interaction terms—demonstrate clear non-linear relationships with the target, indicating that linear models alone may be insufficient and that incorporating non-linear transformations or more flexible models is justified.
+Several predictors (especially interaction terms and geometric metrics) demonstrate clear **non-linear relationships with the target**, indicating that linear models alone may be insufficient and that incorporating non-linear transformations or more flexible models is justified.
 
 #### Feature Selection
 
@@ -1411,49 +1367,44 @@ The features listed in `high_vif_features` were identified through an iterative 
 You can skip this if you wish to keep the correlated features and use only pure backward elimination approach.
 
 ```{r}
-# unimportant_features <- c('seconds_since_midnight',
-#                           'stop_lat',
-#                           'arrival_time_second',
-#                           'platform_codeH',
-#                           'platform_codeJ',
-#                           'trip_headsign_freq',
-#                           'direction_id1',
-#                           'arrival_time_minute',
-#                           'platform_codeB',
-#                           'platform_codeC')
-# unimportant_features <- c()
-# high_vif_features <- c('sin_time', 'cos_time', 'route_type11', 'day_typesunday',
-#                        'arrival_time_hour', 'arrival_seconds')
-# drop_features <- append(unimportant_features, high_vif_features)
-
 
 high_vif_features <- c('sin_time', 'cos_time', 'route_type11',
 'day_typesunday', 'arrival_time_hour', 'arrival_seconds')
-
 
 train_data <- drop_cols_report(train_data, high_vif_features)
 test_data <- drop_cols_report(test_data, high_vif_features)
 
 ```
 
-#### Model Fit & Feature Selection
+#### Model Fit
 
 ```{r}
 
-# lm_model <- lm(segment_time_s ~ ., data = train_data)
-# summary(lm_model)
 lm_model <- lm(segment_time_s ~ ., data = train_data)
+initial_vars <- attr(terms(lm_model), "term.labels")
 
 lm_step <- step(
   lm_model,
   direction = "backward",
   trace = FALSE
 )
+final_vars   <- attr(terms(lm_step), "term.labels")
+
 
 final_lm_formula <- formula(lm_step)
-final_lm_formula
+# final_lm_formula
 
 summary(lm_step)
+```
+#### Features Dropped
+
+Here we list features that were dropped by Backward Elimination Approach.
+
+```{r}
+dropped_vars <- setdiff(initial_vars, final_vars)
+kept_vars    <- final_vars
+
+dropped_vars
 ```
 
 #### VIF
@@ -1462,40 +1413,14 @@ The Variance Inflation Factor (VIF) analysis indicates that **multicollinearity 
 
 ```{r}
 
-# results <- vif(lm_step)
-
 vif_values <- vif(lm_step)
-
 vif_df <- format_vif(vif_values)
-
 vif_df
 
-# importance_rf <- rf_final$variable.importance
-# # importance_rf
-# importance_rf_df <- data.frame(
-#   feature = names(importance_rf),
-#   importance = importance_rf
-# ) %>%
-#   dplyr::arrange(desc(importance))
-# 
-# importance_rf_df
-
-
 ```
 
-#### Homoscedasticity
-
-The scale-location plots reveal that the linear regression model exhibits clear heteroscedasticity, particularly for higher fitted values, where the variance of residuals increases substantially. This indicates that the model fails to adequately capture the underlying structure of the data.
-
-```{r}
-plot_scale_location(lm_step$fitted.values, lm_step$residuals)
-```
 
 #### Evaluation
-
-```         
-The linear regression model achieved an RMSE of 31.68 and MAE of 23.61, indicating moderate prediction errors on average. With an R² of 0.409, the model explains approximately 41% of the variance in segment travel time, demonstrating an improvement over the distance-only baseline. This suggests that incorporating additional predictors provides meaningful information beyond distance alone. However, the model still exhibits limitations in capturing more complex, non-linear relationships present in the data, which constrains its overall predictive performance.
-```
 
 ```{r}
 predict_lm <- function(model, new_data) {
@@ -1515,6 +1440,8 @@ results_lm
 
 ##### Predicted vs. Actual
 
+The plot shows a clear positive relationship between predicted and actual values, indicating that the linear regression model captures the overall trend in the data. However, the predictions are consistently compressed toward the mean, as evidenced by the model trend line being flatter than the perfect prediction line. This suggests that the model tends to underestimate higher values and overestimate lower values, indicating limited ability to capture extreme observations. Additionally, the noticeable spread around the trend line reflects residual variance, implying that while the model performs reasonably well, there is still unexplained variability in the data.
+
 ```{r}
 plot_predicted_vs_actual(
   data = test_data,
@@ -1524,11 +1451,22 @@ plot_predicted_vs_actual(
 )
 ```
 
-##### Normality of Residuals
+##### Homoscedasticity
+
+The scale-location plots reveal that the linear regression model exhibits clear heteroscedasticity, particularly for higher fitted values, where the variance of residuals increases substantially. This indicates that the model fails to adequately capture the underlying structure of the data.
 
 ```{r}
-plot_qq(residuals = residuals(lm_step))
+plot_scale_location(lm_step$fitted.values, lm_step$residuals)
+```
 
+##### Normality of Residuals
+
+The QQ plot compares the distribution of residuals from the linear regression model to a theoretical normal distribution. While the points closely follow the reference line in the central region, indicating approximate normality for the majority of residuals, there are clear deviations in the upper tail. Specifically, the points curve sharply upward, suggesting the presence of heavy right tails and outliers.
+
+This indicates that the residuals are not perfectly normally distributed, with the model underestimating extreme values. Such deviations imply a violation of the normality assumption, although the model may still be adequate for prediction purposes.
+
+```{r}
+plot_qq(residuals = residuals(lm_step), title = "QQ Plot - Linear Regression")
 ```
 
 ### Polynomial Regression
@@ -1548,28 +1486,11 @@ folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
 
 #### Feature Selection
 
-Since polynomial regression does not inherently perform feature selection or regularization, an **iterative, model-driven approach** was adopted. The process began with a relatively rich set of predictors, including engineered and interaction features. The model was then repeatedly refined through successive training and evaluation cycles.
+The same feature selection strategy was applied in this case. The process began with the full set of predictors, followed by backward elimination to reduce the feature space. Subsequently, the statistical output from `summary()` and the Variance Inflation Factor (VIF) were examined to identify predictors exhibiting high multicollinearity. Features with elevated VIF values were iteratively removed, and the model was re-estimated after each step.
 
-After each iteration, the statistical significance of predictors was assessed using the **t-values and corresponding p-values** obtained from the fitted model. Predictors with low statistical significance (i.e., high p-values) were considered uninformative and gradually removed from the feature set.
-
-However, statistical significance alone can be misleading in the presence of **multicollinearity**, which inflates standard errors and destabilizes coefficient estimates. Therefore, the **Variance Inflation Factor (VIF)** was used as a complementary diagnostic tool. Predictors exhibiting high multicollinearity (VIF \> 5) were systematically eliminated to improve model stability and interpretability.
+The final set of removed predictors, identified as highly collinear, is stored in the `high_vif` vector. These features were then consistently excluded from both the training and testing datasets to ensure alignment between the two subsets.
 
 ```{r}
-# unimportant_features <- c('seconds_since_midnight', 'platform_codeD',
-#                           'platform_codeG', 'day_typesaturday', 'day_typesunday',
-#                           'platform_codeF',
-#                           'platform_codeB', 'platform_codeC',
-#                           'direction_id1', 'platform_codeJ', 'platform_codeI', 'route_type11',
-#                           'arrival_seconds', 'arrival_time_hour',
-#                           'route_short_name_freq', 'arrival_time_minute')
-
-# vif>5, handles collinearity
-# high_vif <- c('arrival_time_hour', 'arrival_seconds',
-#               'pickup_type3', 'route_type11', 'sin_time', 'cos_time')
-# 
-# drop_cols <- append(unimportant_features, high_vif)
-# # high_vif <- c()
-
 high_vif <- c('arrival_time_hour', 'arrival_seconds',
               'pickup_type3', 'route_type11', 'sin_time', 'cos_time',
               'day_typeweekday')
@@ -1578,16 +1499,14 @@ train_data <- drop_cols_report(train_data, high_vif)
 test_data <- drop_cols_report(test_data, high_vif)
 ```
 
-```         
-```
 
 #### Model Fit
 
-Based on the previous exploratory analysis, several predictors—most notably the interaction features (`distance_sin_interaction`, `distance_cos_interaction`) and spatial variables (`stop_lat`, `stop_lon`)—exhibited **clear non-linear relationships** with the target variable. In particular, the binned scatterplots revealed **curved and oscillatory patterns**, where the relationship could not be adequately captured by a simple linear trend.
+Exploratory analysis indicated that several predictors (interaction features (`distance_sin_interaction`, `distance_cos_interaction`) and spatial variables (`stop_lat`, `stop_lon`) ) exhibit clear non-linear relationships with the target variable. These patterns, observed as curved and oscillatory trends, cannot be adequately captured by a purely linear model.
 
-To address this, **second-degree polynomial transformations** were introduced for these predictors. The goal was to allow the model to capture **curvature in the relationship**, while still maintaining the simplicity and interpretability of a linear regression framework. Quadratic terms are often sufficient to approximate moderate non-linearities, such as U-shaped or inverted U-shaped patterns observed in the data.
+To address this, second-degree polynomial transformations were introduced to capture curvature while preserving the interpretability of linear regression. The original linear terms were replaced with their polynomial representations to reduce redundancy, and the use of `poly(..., 2)` ensures orthogonality, improving numerical stability.
 
-Importantly, the original (linear) versions of these predictors were replaced with their polynomial representations to avoid redundancy and reduce multicollinearity. The use of `poly(..., 2)` ensures that the resulting polynomial components are **orthogonal**, which stabilizes coefficient estimation and mitigates issues related to correlated predictors
+Although other variables, such as *segment_distance_m* and *arrival_time_hour*, also showed non-linearity, they were found to be redundant given the presence of engineered features. This resulted in rank deficiency, with corresponding coefficients appearing as `NA` in the model output. Consequently, polynomial terms were not applied to these predictors, as they did not provide additional explanatory value.
 
 ```{r}
 lm_poly <- lm(
@@ -1604,21 +1523,24 @@ lm_poly <- lm(
   data = train_data
 )
 
+initial_vars_poly <- attr(terms(lm_poly), "term.labels")
+
 lm_poly <- step(lm_poly, direction = "backward", trace = FALSE)
+
+final_vars_poly <- attr(terms(lm_poly), "term.labels")
 
 poly_final_formula <- formula(lm_poly)
 poly_final_formula
+
+summary(lm_poly)
 ```
+#### Features Dropped
 
-#### Evaluating Predictors
-
-The polynomial regression model achieved an **R² of 0.505**, indicating that approximately **50.5% of the variance** in the target variable (*segment_time_s*) is explained by the selected predictors.
-
-We can see that the polynomial terms now have more significant compared to their linear alternatives. This confirms that these predictors matter, but not linearly.
+Here we list features that were dropped by Backward Elimination Approach.
 
 ```{r}
-summary(lm_poly)
-# length(coef(lm_poly)) - 1
+dropped_vars <- setdiff(initial_vars_poly, final_vars_poly)
+dropped_vars
 ```
 
 #### Variance Inflation Factor
@@ -1627,32 +1549,13 @@ Most predictors show **very low multicollinearity**. The only standout is the *s
 
 ```{r}
 vif(lm_poly)
-
-# vif_poly_values <- vif(lm_poly)
-# 
-# vif_poly_df <- format_vif(vif_poly_values)
-# 
-# vif_poly_df
-```
-
-#### Homoscedasticity
-
-Although some heteroscedasticity remains at the extremes, the inclusion of polynomial terms reduces systematic error and improves model fit, especially for larger target values.
-
-```{r}
-
-# plot_homoscedasticity_plot(lm_poly$fitted.values, lm_poly$residuals)
-
-
-plot_scale_location(lm_poly$fitted.values, lm_poly$residuals)
 ```
 
 #### Evaluation
 
-The polynomial regression model achieved an RMSE of 29.46 and MAE of 21.62, indicating that the average prediction error remains in the range of approximately 20–30 seconds. Compared to linear baselines, the model shows a notable improvement in explanatory power, reaching an R² of 0.489, which means that nearly 49% of the variance in segment travel time is captured. This improvement suggests that incorporating non-linear transformations allows the model to better represent underlying relationships in the data. However, the relatively moderate reduction in absolute error highlights the presence of inherent variability and noise in real-world transport data, which limits further gains in prediction accuracy within the linear modeling framework.
+Compared to linear baselines, the model shows a notable improvement in explanatory power, reaching an R² of 0.489, which means that nearly 49% of the variance in segment travel time is captured. This improvement suggests that incorporating non-linear transformations allows the model to better represent underlying relationships in the data. However, the relatively moderate reduction in absolute error highlights the presence of inherent variability and noise in real-world transport data, which limits further gains in prediction accuracy within the linear modeling framework.
 
 ```{r}
-
 predict_lm <- function(model, new_data) {
   predict(model, newdata = new_data)
 }
@@ -1666,20 +1569,11 @@ results_lm_poly <- eval_train_test(
 )
 
 results_lm_poly
-
-# predictions_lm_poly <- predict(lm_poly, newdata = test_data)
-# 
-# results_lm_poly <- evaluate_regression(
-#   actual = test_data$segment_time_s,
-#   predicted = predictions_lm_poly,
-#   model_name = "Polynomial Regression"
-# )
-# 
-# results_lm_poly
-# predictions_lm <- round(predictions_lm / 15) * 15
 ```
 
 ##### Predicted vs. Actual
+
+The plot demonstrates a clear positive relationship between predicted and actual values, indicating that the polynomial regression model effectively captures the underlying structure of the data. Compared to the linear regression model, the fitted trend line is noticeably closer to the line of perfect prediction, suggesting improved alignment and a better ability to model non-linear patterns.
 
 ```{r}
 plot_predicted_vs_actual(
@@ -1690,11 +1584,20 @@ plot_predicted_vs_actual(
 )
 ```
 
-##### Normality of Resituals
+#### Homoscedasticity
+
+Although some heteroscedasticity remains at the extremes, the inclusion of polynomial terms reduces systematic error and improves model fit, especially for larger target values.
 
 ```{r}
+plot_scale_location(lm_poly$fitted.values, lm_poly$residuals)
+```
 
-plot_qq(residuals = residuals(lm_poly))
+##### Normality of Resituals
+
+The QQ plot for the polynomial regression model shows a similar overall pattern to that of the linear regression model, with residuals closely following the reference line in the central region but deviating in the tails. This suggests that while polynomial regression improves predictive accuracy, it does not fully satisfy the normality assumption of residuals and may even introduce minor deviations in regions where the linear model performed adequately.
+
+```{r}
+plot_qq(residuals = residuals(lm_poly), title = "QQ Plot - Polynomial Regression")
 ```
 
 ### Lasso Regression
@@ -1708,12 +1611,6 @@ split <- create_train_test_split(timetable_transformed, seed = SEED)
 
 train_data <- split$train
 test_data  <- split$test
-
-# non_numeric_cols <- names(train_data)[
-#   !sapply(train_data, is.numeric)
-# ]
-# 
-# non_numeric_cols
 ```
 
 #### Model Fit
@@ -1721,15 +1618,6 @@ test_data  <- split$test
 Prior to training the Lasso model, the dataset was transformed into a suitable format required by the glmnet package. Subsequently, 5-fold cross-validation was applied to determine the optimal regularization parameter (λ), enabling a balance between model complexity and predictive performance.
 
 ```{r}
-# feature_names <- setdiff(names(train_data), TARGET)
-# feature_names
-
-# x_train <- as.matrix(train_data[, feature_names])
-# y_train <- train_data[[TARGET]]
-# 
-# x_test <- as.matrix(test_data[, feature_names])
-# y_test <- test_data[[TARGET]]
-
 glmnet_data <- prepare_glmnet_data(train_data, test_data, TARGET)
 
 x_train <- glmnet_data$x_train
@@ -1790,64 +1678,14 @@ selected_features <- selected_features[selected_features != "(Intercept)"]
 selected_features
 ```
 
-#### Comparing with Feature Selection with LR
-
-```{r}
-vif_df <- vif_df %>%
-  dplyr::mutate(
-    selected_by_lasso = feature %in% selected_features
-  )
-
-vif_df %>%
-  dplyr::arrange(desc(vif))
-```
-
 #### Evaluation
 
 Lasso regression achieved performance comparable to linear regression with backward elimination, with slightly higher RMSE and lower R² on both training and testing sets. While it did not outperform the linear models in predictive accuracy, Lasso provided the advantage of automatic feature selection by shrinking several coefficients to zero, resulting in a simpler and more interpretable model.
 
 ```{r}
-
-# pred_train_lasso <- predict(lasso_model, newx = x_train)
-# pred_test_lasso  <- predict(lasso_model, newx = x_test)
-# 
-# results_lasso <- dplyr::bind_rows(
-#   evaluate_regression(
-#     actual = y_train,
-#     predicted = pred_train_lasso,
-#     model_name = "Lasso train"
-#   ),
-#   evaluate_regression(
-#     actual = y_test,
-#     predicted = pred_test_lasso,
-#     model_name = "Lasso test"
-#   )
-# )
-# 
-# results_lasso
-
-
 predict_glmnet <- function(model, x) {
   as.vector(predict(model, newx = x))
 }
-
-# eval_train_test_glmnet <- function(model, model_label, x_train, y_train, x_test, y_test) {
-#   pred_train <- as.vector(predict(model, newx = x_train))
-#   pred_test  <- as.vector(predict(model, newx = x_test))
-#   
-#   dplyr::bind_rows(
-#     evaluate_regression(
-#       actual = y_train,
-#       predicted = pred_train,
-#       model_name = paste0(model_label, " train")
-#     ),
-#     evaluate_regression(
-#       actual = y_test,
-#       predicted = pred_test,
-#       model_name = paste0(model_label, " test")
-#     )
-#   )
-# }
 
 results_lasso <- eval_train_test_glmnet(
   lasso_model,
@@ -1877,10 +1715,6 @@ test_data  <- split$test
 #### Model Fit
 
 ```{r}
-
-# Elastic Net: alpha between 0 and 1
-# set.seed(42)
-
 glmnet_data <- prepare_glmnet_data(train_data, test_data, TARGET)
 
 x_train <- glmnet_data$x_train
@@ -1896,10 +1730,9 @@ cv_elastic <- cv.glmnet(
   nfolds = CV_N_FOLDS
 )
 
-# best_lambda_elastic_1se <- cv_elastic$lambda.1se
 best_lambda_elastic_1se <- cv_elastic$lambda.1se
+# best_lambda_elastic_1se <- cv_elastic$lambda.min
 best_lambda_elastic_1se
-
 ```
 
 #### Retraining Model
@@ -1918,6 +1751,8 @@ coef_elastic
 
 #### Selected Features
 
+Here we list the selected features by Elastic.
+
 ```{r}
 selected_features_elastic <- rownames(coef_elastic)[coef_elastic[, 1] != 0]
 selected_features_elastic <- selected_features_elastic[
@@ -1928,43 +1763,15 @@ selected_features_elastic
 length(selected_features_elastic)
 ```
 
-#### Comparing Feature Selection with LR
-
-```{r}
-vif_df <- vif_df %>%
-  dplyr::mutate(
-    selected_by_lasso = feature %in% selected_features_elastic
-  )
-
-vif_df %>%
-  dplyr::arrange(desc(vif))
-```
-
 #### Evaluation
+
+The Elastic Net model achieved predictive performance comparable to the linear regression model with backward selection, indicating that it is able to capture the underlying relationships in the data with similar accuracy. However, a key advantage of Elastic Net lies in its ability to produce a more compact model by shrinking and eliminating less informative predictors. As a result, the final model contains fewer features, improving interpretability while reducing the risk of overfitting. In addition, the overall training process of Elastic Net is computationally more efficient compared to the iterative backward elimination procedure used in linear regression.
 
 ```{r}
 
 predict_glmnet <- function(model, x) {
   as.vector(predict(model, newx = x))
 }
-
-# eval_train_test_glmnet <- function(model, model_label, x_train, y_train, x_test, y_test) {
-#   pred_train <- as.vector(predict(model, newx = x_train))
-#   pred_test  <- as.vector(predict(model, newx = x_test))
-#   
-#   dplyr::bind_rows(
-#     evaluate_regression(
-#       actual = y_train,
-#       predicted = pred_train,
-#       model_name = paste0(model_label, " train")
-#     ),
-#     evaluate_regression(
-#       actual = y_test,
-#       predicted = pred_test,
-#       model_name = paste0(model_label, " test")
-#     )
-#   )
-# }
 
 results_elastic <- eval_train_test_glmnet(
   elastic_model,
@@ -1976,42 +1783,19 @@ results_elastic <- eval_train_test_glmnet(
 )
 
 results_elastic
-# 
-# results_elastic <- eval_train_test(
-#   elastic_model,
-#   "Elastic Net",
-#   train_data = x_train,
-#   test_data = x_test,
-#   predict_fun = predict_glmnet
-# )
-# 
-# pred_train_elastic <- predict(elastic_model, newx = x_train)
-# pred_test_elastic  <- predict(elastic_model, newx = x_test)
-# 
-# results_elastic <- dplyr::bind_rows(
-#   evaluate_regression(
-#     actual = y_train,
-#     predicted = pred_train_elastic,
-#     model_name = "Elastic Net train"
-#   ),
-#   evaluate_regression(
-#     actual = y_test,
-#     predicted = pred_test_elastic,
-#     model_name = "Elastic Net test"
-#   )
-# )
-# 
-# results_elastic
-
 ```
 
 ### Tuning & Validation Setup
+
+Before tuning the Decision Tree and Random Forest models, a reusable validation framework was prepared. The training data were further divided into an inner training subset and a validation subset, allowing different hyperparameter combinations to be evaluated without using the final test set. This ensures that the test data remain unseen until the final model evaluation.
+
+To make the tuning process consistent across models, generic helper functions were defined for validation-grid search and cross-validation. These functions accept model-specific fitting and prediction functions, which makes them reusable for both Decision Tree and Random Forest tuning. As a result, different hyperparameter configurations can be compared systematically using the same regression metrics, such as RMSE, MAE, and R².
 
 #### Validation Dataset
 
 ```{r}
 
-set.seed(42)
+set.seed(SEED)
 
 val_ids <- sample(seq_len(nrow(train_data)), size = 0.2 * nrow(train_data))
 
@@ -2077,6 +1861,11 @@ run_cv <- function(folds, fit_fun, predict_fun, params, model_name) {
 
 ### Decision Tree
 
+
+As part of the modelling phase, Decision Trees were introduced as an alternative feature-space partitioning approach. Unlike linear and polynomial regression models, which assume global relationships between predictors and the target variable, Decision Trees recursively partition the feature space into regions with similar response values. This allows the model to naturally capture non-linear relationships and interactions without requiring explicit feature engineering.
+
+From a modelling perspective, Decision Trees represent a balance between the interpretability of regression-based approaches (such as Linear and Polynomial Regression) and the predictive performance of more complex ensemble methods like Random Forests. While they typically achieve better flexibility and performance than simple linear models, they still maintain a relatively transparent structure that can be visualized and interpreted, making them a useful intermediate model in the overall comparison.
+
 #### Train/Test Split & Folds
 
 ```{r}
@@ -2091,33 +1880,30 @@ folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
 
 #### Hyperparameter Tuning
 
-```{r}
-
-# set.seed(42)
-# 
-# val_ids <- sample(seq_len(nrow(train_data)), size = 0.2 * nrow(train_data))
-# 
-# validation_data <- train_data[val_ids, ]
-# train_inner <- train_data[-val_ids, ]
-
-```
 
 ##### Grid
+
+The tuning grid focuses on three key hyperparameters: *maxdepth*, *minsplit*, and *cp* (complexity parameter). The *maxdepth* parameter determines the maximum depth of the tree, with values ranging from shallow (3) to relatively deep (10), allowing the model to capture both simple and more complex patterns. The *minsplit* parameter controls the minimum number of observations required to perform a split, with values of 10 and 20 chosen to prevent overly granular splits that could lead to overfitting. Finally, the *cp* parameter governs pruning by specifying the minimum improvement required for a split; smaller values (0.001) allow more complex trees, while larger values (0.01) enforce stronger regularization.
+
+By selecting this grid our exploration ranged from shallow and more regularized trees (faster computation but risk of underfitting) to
+more complex trees (require more computational time to process and also have tendency
+to overfit).
 
 ```{r}
 dt_grid <- expand.grid(
   maxdepth = c(3, 5, 7, 10),
-  minsplit = c(10, 20),
-  cp = c(0.001, 0.01)
+  minsplit = c(10),
+  cp = c(0.00001, 0.001)
 )
 ```
+
+
+minsplit was fixed to 10 after initial experiments, while maxdepth and cp were tuned because they had clearer impact on model performance.
 
 ##### Tuning
 
 ```{r}
 fit_dt <- function(data, params) {
-  # importance_type <- if (compute_importance) "impurity" else "none"
-
   rpart(
     segment_time_s ~ .,
     data = data,
@@ -2127,7 +1913,6 @@ fit_dt <- function(data, params) {
       minsplit = params$minsplit,
       cp = params$cp
     )
-    # importance = importance_type
   )
 }
 
@@ -2146,16 +1931,16 @@ dt_validation_results <- run_validation_grid(
 dt_validation_results
 ```
 
+The results show that model performance improves consistently with increasing tree depth. As maxdepth grows from 3 to 10, RMSE and MAE decrease while R² increases (up to ~0.76), indicating that deeper trees are better able to capture the underlying structure and non-linear relationships in the data.
+
+At the same time, varying the cp parameter has no observable impact on performance, suggesting that pruning is effectively inactive in this range and does not constrain tree growth. Overall, maxdepth is the dominant factor influencing model performance, while cp plays a negligible role under these settings.
+
 ##### Choosing Best Params
 
 ```{r}
 best_dt_params <- dt_validation_results %>%
   dplyr::arrange(RMSE) %>%
   dplyr::slice(1)
-
-# best_maxdepth = best_dt_params %>% pull(maxdepth)
-# best_minsplit = best_dt_params %>% pull(minsplit)
-# best_cp = best_dt_params %>% pull(cp)
 
 best_dt_params
 ```
@@ -2174,22 +1959,30 @@ cv_dt_summary <- run_cv(
 cv_dt_summary
 ```
 
+The cross-validation results confirm that the Decision Tree model generalizes well to unseen data. The model achieved an RMSE of approximately 20.81, MAE of 12.52, and an R² of 0.74, indicating strong predictive performance.
+
+Compared to the validation results, the cross-validated metrics are very similar, suggesting that the model is stable and not significantly overfitting. This consistency across folds implies that the selected hyperparameters provide a good balance between model complexity and generalization ability.
+
+Overall, the Decision Tree captures a substantial portion of the variability in the target variable while maintaining robustness across different data splits.
+
 #### Model Fit
 
 ```{r}
 dt_final <- fit_dt(train_data, best_dt_params)
-
 ```
 
 #### Evaluation
 
-```{r}
+The evaluation results indicate that the Decision Tree model performs consistently across both training and test datasets. The small gap between training and test performance suggests that the model generalizes well and does not exhibit significant overfitting.
 
+```{r}
 results_dt <- eval_train_test(dt_final, "DT", train_data, test_data, predict_fun = predict_rpart)
 results_dt
 ```
 
 #### Feature Importance
+
+Here we list predictors that were most important to our Decision Tree.
 
 ```{r}
 importance_dt <- dt_final$variable.importance
@@ -2204,6 +1997,14 @@ importance_dt_df
 
 ### Random Forest
 
+To further improve predictive performance, a Random Forest model was introduced as an ensemble extension of Decision Trees. While a single Decision Tree partitions the feature space into regions, it is prone to high variance and can overfit the training data. Random Forest addresses this limitation by constructing a large number of decision trees on bootstrapped samples of the data and aggregating their predictions, typically through averaging in the regression setting.
+
+In addition to bootstrap sampling, Random Forest introduces randomness by selecting a subset of predictors at each split, which decorrelates individual trees and improves generalization. This makes the model significantly more robust and accurate compared to a single tree, especially in the presence of complex, non-linear relationships.
+
+Furthermore, Random Forest is robust to multicollinearity and less sensitive to outliers, while also providing an inherent measure of feature importance. These properties make it a strong candidate for comparison with simpler statistical models.
+
+From a modelling perspective, Random Forest represents the high-performance end of the spectrum: it sacrifices interpretability compared to linear models and single decision trees, but typically achieves superior predictive accuracy.
+
 #### Train/Test Split & Folds
 
 ```{r}
@@ -2216,82 +2017,30 @@ test_data  <- split$test
 folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
 ```
 
-Random Forest was selected as an additional modeling approach due to its ability to capture complex non-linear relationships and interactions between predictors without requiring explicit feature engineering. Furthermore, Random Forest is robust to multicollinearity and less sensitive to outliers, while also providing an inherent measure of feature importance. These properties make it a strong candidate for comparison with simpler statistical models.
-
 #### Hyperparameter tuning
 
-To improve the performance of the Random Forest model, a simple hyperparameter tuning procedure was conducted focusing on the \`mtry\` parameter, which controls the number of predictors considered at each split. This parameter plays a crucial role in balancing model diversity and predictive strength. Two values were evaluated (mtry = 3 and mtry = 5), while keeping other parameters fixed.\
-\
+To improve the performance of the Random Forest model, a simple hyperparameter tuning procedure was conducted focusing on the \`mtry\` parameter, which controls the number of predictors considered at each split. This parameter plays a crucial role in balancing model diversity and predictive strength. Two values were evaluated (mtry = 3 and mtry = 5), while keeping other parameters fixed.
+
 The results show a substantial improvement when increasing \`mtry\` from 3 to 5. Specifically, the model with mtry = 3 achieved an R² of 0.839, whereas mtry = 5 significantly improved performance to an R² of 0.922, accompanied by a notable reduction in both RMSE and MAE. This indicates that allowing the model to consider more predictors at each split enables it to better capture relevant patterns in the data.
 
-##### Validation Dataset
+
+##### Grid
+
+The hyperparameter grid for the Random Forest model focuses on two key parameters: *mtry* and *min.node.size*. The *mtry* parameter controls the number of predictors randomly selected at each split. This allows the model to explore different levels of randomness and feature utilization, balancing between diversity of trees and predictive strength.
+
+The *min.node.size* parameter determines the minimum number of observations required in terminal nodes. Values were selected to compare more detailed trees (smaller nodes) with slightly more regularized ones (larger nodes), helping to assess the impact of model complexity on generalization.
 
 ```{r}
-# set.seed(42)
-# 
-# val_ids <- sample(seq_len(nrow(train_data)), size = 0.2 * nrow(train_data))
-# 
-# validation_data <- train_data[val_ids, ]
-# train_inner <- train_data[-val_ids, ]
-```
-
-##### Dynamic Grid
-
-```{r}
-# p <- ncol(train_inner) - 1  # minus target
-# p
-# 
-# mtry_values <- unique(c(
-#   3,
-#   floor(sqrt(p)),
-#   floor(p / 4)
-# ))
-# 
-# mtry_values
-# 
-# # grid <- expand.grid(
-# #   mtry = mtry_values,
-# #   min.node.size = c(5, 10)
-# # )
 rf_grid <- expand.grid(
   mtry = c(3, 6, 9),
   min.node.size = c(5, 10)
 )
-
 ```
 
 ##### Tuning
 
 ```{r}
-# results <- list()
-# 
-# for (i in 1:nrow(grid)) {
-#   m <- grid$mtry[i]
-#   node <- grid$min.node.size[i]
-#   
-#   model <- ranger(
-#     segment_time_s ~ .,
-#     data = train_inner,
-#     num.trees = 200,
-#     mtry = m,
-#     min.node.size = node,
-#     seed = 42
-#   )
-#   
-#   preds <- predict(model, data = validation_data)$predictions
-#   
-#   res <- evaluate_regression(
-#     actual = validation_data$segment_time_s,
-#     predicted = preds,
-#     model_name = paste("RF mtry =", m, "| node =", node)
-#   ) %>%
-#     dplyr::mutate(mtry = m, min.node.size = node)
-#   
-#   results[[i]] <- res
-# }
-# 
-# validation_results <- dplyr::bind_rows(results)
-# validation_results
+
 fit_rf <- function(data, params, compute_importance = FALSE) {
   importance_type <- if (compute_importance) "impurity" else "none"
 
@@ -2321,62 +2070,29 @@ rf_validation_results <- run_validation_grid(
 rf_validation_results
 ```
 
+The results demonstrate that the Random Forest model significantly benefits from increasing the number of predictors considered at each split (*mtry*). As *mtry* increases from 3 to 9, there is a substantial improvement in performance, with RMSE and MAE decreasing and R² increasing (up to ~0.93). This indicates that allowing the model to consider more features at each split leads to stronger and more accurate trees, likely due to the rich feature space and informative predictors in the dataset.
+
+In contrast, the *min.node.size* parameter has a relatively minor effect on performance. Increasing it from 5 to 10 results in a slight degradation in accuracy, suggesting that smaller terminal nodes (i.e., more detailed trees) better capture the underlying structure of the data.
+
 ##### Choosing Best Params
+
+The best-performing configuration corresponds to the model with the lowest level of regularization, characterized by a smaller *min.node.size* and a higher *mtry* value. 
+
+This result suggests that the dataset benefits from more flexible models that can fully exploit the available feature space. By allowing deeper and more complex trees, the Random Forest is able to capture intricate non-linear relationships, leading to superior predictive performance.
 
 ```{r}
 best_rf_params <- rf_validation_results %>%
   dplyr::arrange(RMSE) %>%
   dplyr::slice(1)
 
-# best_mtry <- best_rf_params %>%
-#   pull(mtry)
-#        
-# best_min_node_size <- best_rf_params %>%
-#   pull(min.node.size)
-
 best_rf_params
 ```
 
 #### Cross Validation
 
+Compared to the validation results, the cross-validated metrics are very similar, suggesting that the model generalizes well and does not suffer from overfitting. The consistently high R² across folds demonstrates that the Random Forest effectively captures the complex, non-linear relationships present in the data while maintaining robustness to different data splits.
+
 ```{r}
-
-# fit_rf <- function(data, mtry, min_node_size, seed = 42) {
-#   ranger(
-#     segment_time_s ~ .,
-#     data = data,
-#     num.trees = 200,
-#     mtry = mtry,
-#     min.node.size = min_node_size,
-#     importance = "impurity",
-#     seed = seed
-#   )
-# }
-
-# cv_rf <- purrr::map_dfr(folds$splits, function(split) {
-#   train_fold <- rsample::analysis(split)
-#   valid_fold <- rsample::assessment(split)
-#   
-#   model <- fit_rf(train_fold, params = best_params)
-#   preds <- predict(model, data = valid_fold)$predictions
-#   
-#   evaluate_regression(
-#     actual = valid_fold$segment_time_s,
-#     predicted = preds,
-#     model_name = "RF (CV fold)"
-#   )
-# })
-# 
-# cv_rf_summary <- cv_rf %>%
-#   summarise(
-#     RMSE = mean(RMSE),
-#     MAE  = mean(MAE),
-#     R2   = mean(R2)
-#   ) %>%
-#   mutate(model = "Random Forest (CV)") %>%
-#   select(model, RMSE, MAE, R2)
-# 
-# cv_rf_summary
 cv_rf_summary <- run_cv(
   folds = folds,
   fit_fun = fit_rf,
@@ -2390,54 +2106,29 @@ cv_rf_summary
 
 #### Model Fit
 
-The Random Forest model was implemented using the `ranger` package, which offers a more computationally efficient alternative to the standard implementation. The model was trained using 100 trees (`num.trees = 100`), providing a balance between predictive performance and training time. The `mtry` parameter was set to 5 based on prior tuning results.
-
-To control model complexity and reduce overfitting, the minimum node size was set to 10 (`min.node.size = 10`), ensuring that splits are only performed when sufficient data is available. Feature importance was computed using the impurity-based measure (`importance = "impurity"`), enabling identification of the most influential predictors.
-
-Overall, this configuration reflects a compromise between efficiency and predictive accuracy, leveraging the strengths of Random Forest while maintaining reasonable computational cost.
+The Random Forest model was implemented using the `ranger` package, which offers a more computationally efficient alternative to the standard implementation.
 
 ```{r}
-
-# rf_final <- fit_rf(train_data, mtry = best_mtry, min_node_size = best_min_node_size)
 rf_final <- fit_rf(train_data, params = best_rf_params, compute_importance = TRUE)
-# summary(rf_final)
 ```
 
 #### Evaluation
 
-The Random Forest model was evaluated on both training and test datasets to assess its predictive performance and potential overfitting. On the training data, the model achieved an RMSE of 7.71 and an R² of 0.965, indicating an excellent fit and strong ability to capture patterns in the data. However, such high performance on training data may also suggest a tendency to overfit.\
-To verify generalization, the model was evaluated on unseen test data, where it achieved an RMSE of 12.13 and an R² of 0.913. Although there is a noticeable decrease in performance compared to the training results, the model still maintains high predictive accuracy. This gap between training and test performance indicates a moderate level of overfitting, which is expected for flexible models such as Random Forest, but does not significantly impair its ability to generalize.
+The Random Forest model was evaluated on both training and test datasets to assess its predictive performance and potential overfitting. Results on training data indicate an excellent fit and strong ability to capture patterns in the data. However, such high performance on training data may also suggest a tendency to overfit.
+
+To verify generalization, the model was evaluated on unseen test data. Although there is a noticeable decrease in performance compared to the training results, the model still maintains high predictive accuracy. This gap between training and test performance indicates a moderate level of overfitting, which is expected for flexible models such as Random Forest, but does not significantly impair its ability to generalize.
 
 ```{r}
-# pred_train_rf <- predict(rf_final, data = train_data)$predictions
-# pred_test_rf  <- predict(rf_final, data = test_data)$predictions
-
 results_rf <- eval_train_test(rf_final, "RF", train_data, test_data, predict_fun = predict_ranger)
 results_rf
-
-# results_rf <- dplyr::bind_rows(
-#   evaluate_regression(
-#     actual = train_data$segment_time_s,
-#     predicted = pred_train_rf,
-#     model_name = "Random Forest train"
-#   ),
-#   evaluate_regression(
-#     actual = test_data$segment_time_s,
-#     predicted = pred_test_rf,
-#     model_name = "Random Forest test"
-#   )
-# )
-# 
-# results_rf
 ```
 
 #### Feature Importance
 
-The feature importance analysis derived from the Random Forest model highlights **segment_distance_m** as the most influential predictor by a substantial margin, indicating that travel time is primarily driven by the physical distance between stops. This is consistent with domain expectations. Among the remaining predictors, spatial features such as **stop_lon** and **stop_lat** also exhibit strong importance, suggesting that location-specific factors contribute significantly to travel time variability. Engineered interaction features (**distance_sin_interaction** and **distance_cos_interaction**) rank highly as well, confirming that incorporating temporal patterns into distance-based measures enhances predictive power. Additionally, frequency-encoded categorical variables, including **stop_name_freq**, **route_short_name_freq**, and **trip_headsign_freq**, provide meaningful signal, likely capturing route-specific and operational characteristics.
+Here we list the importance of predictors used by our RF from highest to lowest.
 
 ```{r}
 importance_rf <- rf_final$variable.importance
-# importance_rf
 importance_rf_df <- data.frame(
   feature = names(importance_rf),
   importance = importance_rf
@@ -2445,44 +2136,92 @@ importance_rf_df <- data.frame(
   dplyr::arrange(desc(importance))
 
 importance_rf_df
-
-
-
 ```
 
-### Tree Comparison
-
-#### Feature Importance Combined
-
-```{r}
-importance_rf_df <- importance_rf_df %>%
-  mutate(model = "Random Forest")
-
-importance_dt_df <- importance_dt_df %>%
-  mutate(model = "Decision Tree")
-
-importance_combined <- dplyr::bind_rows(
-  importance_rf_df,
-  importance_dt_df
-)
-
-importance_combined %>%
-  dplyr::group_by(model) %>%
-  dplyr::slice_max(importance, n = 10) %>%
-  ggplot(aes(x = reorder(feature, importance), y = importance, fill = model)) +
-  geom_col(show.legend = FALSE) +
-  coord_flip() +
-  facet_wrap(~model, scales = "free") +
-  theme_minimal()
-```
 
 ## Conclusion
+
+### Model Performance Comparison
+
+```{r}
+all_results <- bind_rows(
+  results_lm,
+  results_lm_poly,
+  results_lasso,
+  results_elastic,
+  results_dt,
+  results_rf
+)
+
+all_results <- all_results %>%
+  arrange(desc(R2)) %>%
+  filter(grepl("test", model))
+  
+all_results
+```
+
+The comparison of test-set performance clearly highlights substantial differences between the evaluated modelling approaches. The Random Forest model achieves the best results which indicates that it is able to capture the vast majority of the variability in the target variable, reflecting its strong ability to model complex, non-linear relationships.
+
+The Decision Tree model represents a strong intermediate solution, achieving an R² of 0.76. While its performance is significantly lower than that of Random Forest, it still substantially outperforms all regression-based models, confirming the importance of non-linear feature-space partitioning for this task.
+
+Among the statistical models, Polynomial Regression provides the best performance, demonstrating that incorporating non-linear transformations improves predictive accuracy compared to purely linear approaches. However, the improvement remains limited relative to tree-based models. Linear Regression, Lasso, and Elastic Net exhibit very similar performance, suggesting that regularization does not provide significant benefits in this setting and that the underlying relationships cannot be adequately captured by linear assumptions alone.
+
+#### R2
+
+Let's compare models altogether and visualize the results using several plots. We are going to compare R², RMSE and MAE. R² is plotted separately as it uses different scale.
+
+```{r}
+ggplot(all_results, aes(x = reorder(model, R2), y = R2)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Model Comparison (Test Set)",
+    x = "Model",
+    y = "R²"
+  )
+```
+
+
+#### Errors
+
+```{r}
+
+# Get order based on RMSE
+model_order <- all_results %>%
+  arrange(desc(RMSE)) %>%
+  pull(model)
+
+# Pivot + apply factor ordering
+all_results_long <- all_results %>%
+  pivot_longer(cols = c(RMSE, MAE), names_to = "metric", values_to = "value") %>%
+  mutate(model = factor(model, levels = model_order))
+
+# Plot
+ggplot(all_results_long, aes(x = model, y = value, fill = metric)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Model Comparison Across Metrics",
+    x = "Model",
+    y = "Value"
+  )
+```
+  
+  
 
 ### Regression Models vs. Tree-based Models
 
 #### Informative Features
 
-In this section we analyze features that were used during final fitting of all models (LR, PR, LR and RF).
+In this section we analyze features that were used during training at least one
+of the models that compose the following model families:
+
+1. **Regression Models (LR, PR)**
+2. **Tree-based Models (DT, RF)**
+
+
 
 ```{r}
 extract_lm_features <- function(model, model_name) {
@@ -2507,77 +2246,57 @@ extract_tree_features <- function(importance_values, model_name) {
 Was feature retained by model? This condition is expressed as boolean flag in the following table:
 
 ```{r}
-features_lr <- extract_lm_features(lm_step, "Linear Regression")
-features_pr <- extract_lm_features(lm_poly, "Polynomial Regression")
+# --- Extract feature sets ---
+lr_features <- unique(features_lr$feature)
+pr_features <- unique(features_pr$feature)
 
-features_dt <- extract_tree_features(
-  dt_final$variable.importance,
-  "Decision Tree"
-)
+dt_features <- unique(features_dt$feature)
+rf_features <- unique(features_rf$feature)
 
-features_rf <- extract_tree_features(
-  rf_final$variable.importance,
-  "Random Forest"
-)
+# --- Create unified feature space ---
+all_features <- unique(c(
+  lr_features, pr_features,
+  dt_features, rf_features
+))
 
-all_model_features <- dplyr::bind_rows(
-  features_lr,
-  features_pr,
-  features_dt %>% select(model, feature),
-  features_rf %>% select(model, feature)
-)
-
-feature_presence <- all_model_features %>%
-  mutate(present = TRUE) %>%
-  pivot_wider(
-    names_from = model,
-    values_from = present,
-    values_fill = FALSE
-  )
-
-feature_presence
-```
-
-#### Features Common to Both Families
-
-Now we want to analyze which features were retained by regression model families and also by tree-based families.
-
-```{r}
-regression_features <- bind_rows(features_lr, features_pr) %>%
-  pull(feature) %>%
-  unique()
-
-tree_features <- bind_rows(
-  features_dt,
-  features_rf
+feature_presence_reduced <- tibble(
+  feature = all_features
 ) %>%
-  pull(feature) %>%
-  unique()
+  mutate(
+    statistical_models = feature %in% lr_features | feature %in% pr_features,
+    tree_based_models  = feature %in% dt_features | feature %in% rf_features
+  ) %>%
+  mutate(
+    priority = case_when(
+      statistical_models & tree_based_models ~ 1,  # TRUE TRUE
+      statistical_models | tree_based_models ~ 2,  # at least one TRUE
+      TRUE ~ 3                                    # FALSE FALSE
+    )
+  ) %>%
+  arrange(priority) %>%
+  select(-priority)
 
-common_features <- intersect(regression_features, tree_features)
-
-common_features
+feature_presence_reduced
 ```
 
-#### Other benefits and drawbacks
+The analysis reveals a substantial set of features that are consistently retained across both statistical and tree-based model families, indicating strong and robust predictive signals. These include spatial, temporal, and engineered interaction features, suggesting that the underlying phenomenon is well captured by both global and partition-based modelling approaches.
 
-The evaluated models highlight a clear trade-off between interpretability and predictive performance. Linear regression offers the highest level of interpretability, as the relationship between predictors and the target variable is directly expressed through model coefficients. This makes it easy to understand the direction and magnitude of each feature’s effect, but its simplicity limits its ability to capture complex patterns, resulting in weaker predictive performance. Polynomial regression extends this approach by incorporating nonlinear terms, improving performance while still retaining partial interpretability, although the presence of higher-order terms makes direct interpretation more difficult.
+Polynomial features are exclusively utilized by statistical models, reflecting their role in explicitly modelling non-linear relationships. In contrast, tree-based models do not require such transformations, as they inherently capture non-linearity through recursive partitioning.
 
-Decision trees represent a different approach based on feature-space partitioning, where the model splits the data into regions using hierarchical rules. This provides intuitive, rule-based interpretability, as predictions can be traced through decision paths. However, single trees are often unstable and sensitive to small changes in the data. Random Forest further extends this idea by combining multiple trees, significantly improving predictive performance and robustness. As a result, it achieved the best performance among the evaluated models. However, this comes at the cost of reduced interpretability, as the ensemble structure makes it difficult to directly explain individual predictions, relying instead on aggregate measures such as feature importance.
+Conversely, several raw and highly correlated features are retained only by tree-based models. This highlights the ability of tree-based approaches to handle multicollinearity and redundancy.
+
 
 ### Algorithmic vs. Feature-Selection Methods
 
 ```{r}
 
 n_features_backward <- length(coef(lm_step)) - 1
-
 n_features_lasso <- sum(coef(lasso_model) != 0) - 1
-
 n_features_elastic <- sum(coef(elastic_model) != 0) - 1
 
 selection_summary <- tibble::tibble(
   model = c("Linear Regression (Backward)", "Lasso Regression", "Elastic Net"),
-  selection_type = c("Algorithmic / wrapper", "Embedded", "Embedded"),
+  # selection_type = c("Algorithmic / wrapper", "Embedded", "Embedded"),
   retained_features = c(
     n_features_backward,
     n_features_lasso,
@@ -2612,5 +2331,12 @@ feature_selection_table <- tibble::tibble(
   ) %>%
   dplyr::arrange(desc(selected_count), feature)
 
-feature_selection_table
+feature_selection_table %>% select(-all_of(c('selected_count')))
 ```
+
+
+Core subset of predictors is consistently retained across all three methods, including variables such as *segment_distance_m*, interaction features (*distance_sin_interaction*, *distance_cos_interaction*), temporal variables (*seconds_since_midnight*), and several encoded categorical features (e.g., *platform_code*, *route_*). These features can be considered highly informative and robust, as their predictive value is confirmed regardless of the selection approach.
+
+Second, Lasso and Elastic Net retain a group of additional predictors that are excluded by backward elimination, such as *arrival_seconds*, *arrival_time_hour*, and trigonometric features (*sin_time*). These variables are likely correlated with other predictors, which leads to their removal in backward selection due to multicollinearity concerns. In contrast, regularization-based methods are more tolerant of correlated features.
+
+Conversely, backward elimination preserves several features that are removed by both Lasso and Elastic Net, including *arrival_time_minute*, *pickup_type3*, and multiple platform-related indicators.
