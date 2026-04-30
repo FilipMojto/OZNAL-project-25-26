@@ -81,6 +81,30 @@ library("rpart") # decision tree
 library("ranger")
 library("glmnet") # for lasso regression
 library("rsample") # for cv
+library("e1071") # for support vector machine
+```
+
+### Lib Installation
+
+When starting the code for the first time, feel free to uncomment this section to install the packages first.
+
+```{r}
+# ---- Package installation (run once if needed) ----
+# install.packages(c(
+#   "tidyverse",
+#   "readr",
+#   "dplyr",
+#   "ggplot2",
+#   "patchwork",
+#   "purrr",
+#   "car",
+#   "rpart",
+#   "ranger",
+#   "glmnet",
+#   "rsample",
+#   "e1071"
+# ))
+
 ```
 
 ### Constants
@@ -629,22 +653,6 @@ plot_hist_dist <- function(df, var_name, bins = 30, show_density = FALSE) {
     )
 }
 
-# plot_hist_dist <- function(df, var_name, bins = 30) {
-#   ggplot(df, aes(x = !!sym(var_name))) +
-#     geom_histogram(
-#       fill = "steelblue", 
-#       color = "white", 
-#       bins = bins, 
-#       alpha = 0.8
-#     ) +
-#     theme_minimal() +
-#     labs(
-#       title = paste("Distribution of", var_name),
-#       x = var_name,
-#       y = "Frequency"
-#     )
-# }
-
 plot_box_dist <- function(df, var_name) {
   ggplot(df, aes(x = !!sym(var_name))) +
     # Adding a dummy y-axis value or a factor(0) helps boxplot orientation
@@ -729,14 +737,6 @@ In addition to temporal encoding, interaction features were introduced to model 
 
 ```{r}
 timetable_engineered <- add_engineered_features(timetable_encoded)
-
-# timetable_engineered <- timetable_encoded %>%
-#   mutate(
-#     sin_time = sin(2 * pi * seconds_since_midnight / 86400),
-#     cos_time = cos(2 * pi * seconds_since_midnight / 86400),
-#     distance_sin_interaction = segment_distance_m * sin_time,
-#     distance_cos_interaction = segment_distance_m * cos_time,
-#   )
 
 glimpse(timetable_engineered)
 ```
@@ -1181,7 +1181,6 @@ timetable <- readRDS("./datasets/timetable_engineered.rds")
 
 features_to_drop <- c('time_since_last_stop')
 timetable <- drop_cols_report(timetable, features_to_drop)
-
 ```
 
 ### Transformations
@@ -1203,7 +1202,8 @@ timetable_transformed <- timetable %>%
 
 timetable_transformed <- add_engineered_features(timetable_transformed)
 
-plot_predictor_boxplots(timetable_transformed %>% select(problematic_features), target_col = 'segment_time_s')
+plot_predictor_boxplots(timetable_transformed %>% select(all_of(problematic_features)), target_col = 'segment_time_s')
+
 ```
 
 From the box plots above it is clear that the skewness has been successfully eliminated for all the problematic features.
@@ -1376,11 +1376,39 @@ test_data <- drop_cols_report(test_data, high_vif_features)
 
 ```
 
+#### Cross-Validation
+
+```{r}
+
+fit_lm_backward <- function(data, params = NULL) {
+  lm_model <- lm(segment_time_s ~ ., data = data)
+
+  step(
+    lm_model,
+    direction = "backward",
+    trace = FALSE
+  )
+}
+
+cv_lm_summary <- run_cv(
+  folds = folds,
+  fit_fun = fit_lm_backward,
+  predict_fun = predict_lm,
+  params = NULL,
+  model_name = "Linear Regression Backward"
+)
+
+cv_lm_summary
+```
+
+The cross-validation results for the backward-selected linear regression model indicate stable but relatively modest predictive performance. The average performance aligns closely with the individual folds, suggesting low variability and good stability of the model across different data splits. This consistency indicates that the model generalizes reliably and does not suffer from high variance or overfitting.
+
 #### Model Fit
 
 ```{r}
 
-lm_model <- lm(segment_time_s ~ ., data = train_data)
+# lm_model <- lm(segment_time_s ~ ., data = train_data)
+lm_model <- fit_lm_backward(train_data)
 initial_vars <- attr(terms(lm_model), "term.labels")
 
 lm_step <- step(
@@ -1396,6 +1424,7 @@ final_lm_formula <- formula(lm_step)
 
 summary(lm_step)
 ```
+
 #### Features Dropped
 
 Here we list features that were dropped by Backward Elimination Approach.
@@ -1499,6 +1528,45 @@ train_data <- drop_cols_report(train_data, high_vif)
 test_data <- drop_cols_report(test_data, high_vif)
 ```
 
+#### Cross-Validation
+
+```{r}
+fit_lm_poly_backward <- function(data, params = NULL) {
+  
+  model <- lm(
+    segment_time_s ~ 
+      . -
+      distance_sin_interaction -
+      distance_cos_interaction -
+      stop_lat -
+      stop_lon +
+      poly(distance_sin_interaction, 2) +
+      poly(distance_cos_interaction, 2) +
+      poly(stop_lat, 2) +
+      poly(stop_lon, 2),
+    data = data
+  )
+  
+  step(model, direction = "backward", trace = FALSE)
+}
+
+predict_lm <- function(model, new_data) {
+  predict(model, newdata = new_data)
+}
+
+cv_lm_poly <- run_cv(
+  folds = folds,
+  fit_fun = fit_lm_poly_backward,
+  predict_fun = predict_lm,
+  params = NULL,
+  model_name = "Polynomial Regression Backward"
+)
+
+cv_lm_poly
+```
+
+The cross-validation results for the polynomial regression model indicate a moderate improvement over the linear baseline, but still relatively limited predictive performance. At the same time, the variability across folds is very low, suggesting that the model is stable and does not suffer from high variance. 
+
 
 #### Model Fit
 
@@ -1509,19 +1577,20 @@ To address this, second-degree polynomial transformations were introduced to cap
 Although other variables, such as *segment_distance_m* and *arrival_time_hour*, also showed non-linearity, they were found to be redundant given the presence of engineered features. This resulted in rank deficiency, with corresponding coefficients appearing as `NA` in the model output. Consequently, polynomial terms were not applied to these predictors, as they did not provide additional explanatory value.
 
 ```{r}
-lm_poly <- lm(
-  segment_time_s ~ 
-    . -
-    distance_sin_interaction -
-    distance_cos_interaction -
-    stop_lat -
-    stop_lon +
-    poly(distance_sin_interaction, 2) +
-    poly(distance_cos_interaction, 2) +
-    poly(stop_lat, 2) +
-    poly(stop_lon, 2),
-  data = train_data
-)
+# lm_poly <- lm(
+#   segment_time_s ~ 
+#     . -
+#     distance_sin_interaction -
+#     distance_cos_interaction -
+#     stop_lat -
+#     stop_lon +
+#     poly(distance_sin_interaction, 2) +
+#     poly(distance_cos_interaction, 2) +
+#     poly(stop_lat, 2) +
+#     poly(stop_lon, 2),
+#   data = train_data
+# )
+lm_poly <- fit_lm_poly_backward(train_data)
 
 initial_vars_poly <- attr(terms(lm_poly), "term.labels")
 
@@ -1834,7 +1903,10 @@ run_validation_grid <- function(grid, fit_fun, predict_fun, train_inner, validat
 
 ```{r}
 run_cv <- function(folds, fit_fun, predict_fun, params, model_name) {
-  cv_results <- purrr::map_dfr(folds$splits, function(split) {
+  
+  cv_results <- purrr::map_dfr(seq_along(folds$splits), function(i) {
+    split <- folds$splits[[i]]
+    
     train_fold <- rsample::analysis(split)
     valid_fold <- rsample::assessment(split)
 
@@ -1844,18 +1916,24 @@ run_cv <- function(folds, fit_fun, predict_fun, params, model_name) {
     evaluate_regression(
       actual = valid_fold$segment_time_s,
       predicted = preds,
-      model_name = paste(model_name, "CV fold")
-    )
+      model_name = paste(model_name, "fold", i)
+    ) %>%
+      mutate(fold = as.character(i))   # 👈 FIX HERE
   })
 
-  cv_results %>%
-    dplyr::summarise(
+  summary_row <- cv_results %>%
+    summarise(
       RMSE = mean(RMSE),
       MAE  = mean(MAE),
       R2   = mean(R2)
     ) %>%
-    dplyr::mutate(model = paste(model_name, "(CV)")) %>%
-    dplyr::select(model, RMSE, MAE, R2)
+    mutate(
+      model = paste(model_name, "(CV mean)"),
+      fold = "mean"
+    )
+
+  bind_rows(cv_results, summary_row) %>%
+    select(model, fold, RMSE, MAE, R2)
 }
 ```
 
@@ -2136,6 +2214,143 @@ importance_rf_df <- data.frame(
   dplyr::arrange(desc(importance))
 
 importance_rf_df
+```
+
+
+### Support Vector Regression
+
+#### Train/Test Split
+
+```{r}
+split <- create_train_test_split(timetable_transformed, seed = SEED)
+
+train_data <- split$train
+test_data  <- split$test
+
+
+folds <- create_folds(train_data, v = CV_N_FOLDS, seed = SEED)
+```
+
+#### Scaling
+
+```{r}
+
+summary(train_data$arrival_time_minute)
+
+train_scaled <- scale(train_data)
+test_scaled  <- scale(test_data)
+
+# summary(train_scaled$segment_distance_m)
+
+
+```
+
+#### Hyperparameter Tuning
+
+##### Grid
+
+```{r}
+svr_grid <- expand.grid(
+  C = c(0.1, 1, 10),
+  gamma = c(0.01, 0.1),
+  epsilon = c(0.1, 1)
+)
+```
+
+##### Tuning
+
+```{r}
+dt_validation_results <- run_validation_grid(
+  grid = svr_grid,
+  fit_fun = fit_svr,
+  predict_fun = predict_svr,
+  train_inner = train_inner,
+  validation_data = validation_data
+)
+
+dt_validation_results
+```
+
+
+#### Fit
+
+```{r}
+
+fit_svr <- function(data, params) {
+  x_train <- data %>% select(-segment_time_s)
+  y_train <- data$segment_time_s
+
+  means <- sapply(x_train, mean, na.rm = TRUE)
+  sds <- sapply(x_train, sd, na.rm = TRUE)
+  sds[sds == 0] <- 1
+
+  x_train_scaled <- as.data.frame(scale(x_train, center = means, scale = sds))
+
+  model <- svm(
+    x = x_train_scaled,
+    y = y_train,
+    type = "eps-regression",
+    kernel = "radial",
+    cost = params$C,
+    gamma = params$gamma,
+    epsilon = params$epsilon
+  )
+
+  list(
+    model = model,
+    means = means,
+    sds = sds
+  )
+}
+
+predict_svr <- function(model_obj, new_data) {
+  x_new <- new_data %>% select(-segment_time_s)
+
+  x_new_scaled <- as.data.frame(
+    scale(x_new, center = model_obj$means, scale = model_obj$sds)
+  )
+
+  predict(model_obj$model, newdata = x_new_scaled)
+}
+
+
+# svr_model <- fit_svr(train_scaled)
+
+```
+
+#### Quick Fit
+
+```{r}
+
+glimpse(train_data)
+
+filtered_train <- train_data %>%
+  # select(all_of(c(TARGET, "segment_distance_m"))) %>%
+  slice_sample(n = 15000)
+
+filtered_test <- test_data %>%
+  # select(all_of(c(TARGET, "segment_distance_m"))) %>%
+  slice_sample(n = 15000)
+
+
+# glimpse(filtered_train)
+quick_params <- list(
+  C = 1,
+  gamma = 1 / (ncol(filtered_train) - 1),  # safe default
+  epsilon = 0.1
+)
+
+svr_final <- fit_svr(filtered_train, quick_params)
+
+pred_test <- predict_svr(svr_final, filtered_test)
+
+results_svr <- evaluate_regression(
+  actual = filtered_test$segment_time_s,
+  predicted = pred_test,
+  model_name = "SVR (quick)"
+)
+
+results_svr
 ```
 
 
