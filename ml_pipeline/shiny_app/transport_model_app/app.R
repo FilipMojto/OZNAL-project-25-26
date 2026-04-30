@@ -3,6 +3,7 @@ library(tidyverse)
 library(glmnet)
 library(rpart)
 library(ranger)
+library(shinycssloaders)
 
 source("R/utils.R")
 
@@ -12,9 +13,12 @@ ui <- fluidPage(
   titlePanel("Regression Model Comparison"),
   
   tags$style(HTML("
-    #predictors {
-      column-count: 2;
-    }
+    .pred-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 8px; }
+    .pred-row { display: flex; align-items: flex-start; gap: 4px; min-width: 0; }
+    .pred-row .form-group { margin-bottom: 0; flex: 1; min-width: 0; }
+    .pred-row .checkbox { margin-top: 2px; margin-bottom: 2px; }
+    .pred-row .checkbox label { font-size: 12px; font-weight: normal; word-break: break-all; }
+    .pred-row input[type=number] { width: 46px !important; padding: 2px 4px; height: 24px; font-size: 12px; flex-shrink: 0; margin-top: 3px; }
   ")),
   
   sidebarLayout(
@@ -25,23 +29,10 @@ ui <- fluidPage(
                   choices = c("Linear Regression", "Polynomial Regression",
                               "Lasso", "Elastic Net", "DT", "RF")),
       
-      selectInput("target", "Target variable:", choices = NULL),
-      
-      checkboxGroupInput(
-        "predictors",
-        "Predictors:",
-        choices = NULL,
-        selected = NULL,
-        inline = FALSE
-      ),
+      uiOutput("predictors_ui"),
       
       sliderInput("train_split", "Training split:",
                   min = 0.5, max = 0.9, value = 0.8),
-      
-      conditionalPanel(
-        condition = "input.model == 'Polynomial Regression'",
-        numericInput("degree", "Polynomial degree:", value = 2, min = 1, max = 5)
-      ),
       
       conditionalPanel(
         condition = "input.model == 'Elastic Net'",
@@ -73,13 +64,13 @@ ui <- fluidPage(
     
     mainPanel(
       tabsetPanel(
-        tabPanel("Data Preview", tableOutput("data_preview")),
-        tabPanel("Predicted vs Actual", plotOutput("pred_actual")),
-        tabPanel("Residuals", plotOutput("residuals")),
-        tabPanel("Scale-Location", plotOutput("scale_location")),
-        tabPanel("QQ Plot", plotOutput("qq_plot")),
-        tabPanel("Metrics", tableOutput("metrics")),
-        tabPanel("Selected Features", tableOutput("selected_features"))
+        tabPanel("Data Preview", withSpinner(tableOutput("data_preview"))),
+        tabPanel("Predicted vs Actual", withSpinner(plotOutput("pred_actual", height = "600px"))),
+        tabPanel("Residuals", withSpinner(plotOutput("residuals"))),
+        tabPanel("Scale-Location", withSpinner(plotOutput("scale_location"))),
+        tabPanel("QQ Plot", withSpinner(plotOutput("qq_plot"))),
+        tabPanel("Metrics", withSpinner(tableOutput("metrics"))),
+        tabPanel("Selected Features", withSpinner(tableOutput("selected_features")))
       )
     )
   )
@@ -99,54 +90,78 @@ server <- function(input, output, session) {
     }
   })
   
-  observe({
+  predictor_choices_r <- reactive({
     req(dataset())
     data <- dataset()
-    
     numeric_cols <- names(data)[sapply(data, is.numeric)]
-    
-    updateSelectInput(
-      session,
-      "target",
-      choices = numeric_cols,
-      selected = if ("segment_time_s" %in% numeric_cols) "segment_time_s" else numeric_cols[1]
+    setdiff(numeric_cols, "segment_time_s")
+  })
+
+  poly_degree_defaults <- c(
+    stop_lat                  = 2,
+    stop_lon                  = 2,
+    distance_sin_interaction  = 2,
+    distance_cos_interaction  = 2
+  )
+
+  output$predictors_ui <- renderUI({
+    choices <- predictor_choices_r()
+    is_poly <- isTRUE(input$model == "Polynomial Regression")
+
+    tagList(
+      tags$label("Predictors:"),
+      tags$div(class = "pred-grid",
+        lapply(choices, function(p) {
+          if (is_poly) {
+            default_deg <- if (p %in% names(poly_degree_defaults)) poly_degree_defaults[[p]] else 1
+            tags$div(class = "pred-row",
+              checkboxInput(paste0("pred_", p), label = p, value = TRUE),
+              numericInput(paste0("deg_", p), label = NULL, value = default_deg, min = 1, max = 10, width = "52px")
+            )
+          } else {
+            tags$div(class = "pred-row",
+              checkboxInput(paste0("pred_", p), label = p, value = TRUE)
+            )
+          }
+        })
+      )
     )
   })
-  
-  observeEvent(input$target, {
-    req(dataset())
-    
-    data <- dataset()
-    numeric_cols <- names(data)[sapply(data, is.numeric)]
-    predictor_choices <- setdiff(numeric_cols, input$target)
-    
-    updateCheckboxGroupInput(
-      session,
-      "predictors",
-      choices = predictor_choices,
-      selected = predictor_choices
-    )
+
+  selected_predictors <- reactive({
+    choices <- predictor_choices_r()
+    Filter(function(p) isTRUE(input[[paste0("pred_", p)]]), choices)
   })
   
   fit <- eventReactive(input$fit_model, {
     req(dataset())
-    req(input$target)
-    req(input$predictors)
-    
+    preds <- selected_predictors()
+
     validate(
-      need(length(input$predictors) > 0, "Select at least one predictor.")
+      need(length(preds) > 0, "Select at least one predictor.")
     )
-    
-    
+
+    degrees <- if (input$model == "Polynomial Regression") {
+      setNames(
+        sapply(preds, function(p) {
+          val <- input[[paste0("deg_", p)]]
+          if (is.null(val) || is.na(val)) 1L else max(1L, as.integer(val))
+        }),
+        preds
+      )
+    } else {
+      NULL
+    }
+
     fit_selected_model(
       data = dataset(),
       model_type = input$model,
-      target = input$target,
-      predictors = input$predictors,
+      target = "segment_time_s",
+      predictors = preds,
       split = input$train_split,
       alpha = input$alpha,
       lambda = input$lambda,
-      degree = input$degree,
+      degrees = degrees,
       dt_maxdepth = input$dt_maxdepth,
       dt_cp = input$dt_cp,
       rf_trees = input$rf_trees,
@@ -154,7 +169,7 @@ server <- function(input, output, session) {
       rf_min_node = input$rf_min_node
     )
   })
-  
+
   # output$data_preview <- renderTable({
   #   req(dataset())
   #   head(dataset(), 10)

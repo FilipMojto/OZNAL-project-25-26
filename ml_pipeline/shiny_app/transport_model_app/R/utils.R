@@ -409,7 +409,7 @@ fit_selected_model <- function(data, model_type, target, predictors,
                                split = 0.8,
                                alpha = 0.5,
                                lambda = 0.01,
-                               degree = 2,
+                               degrees = NULL,
                                dt_maxdepth = 6,
                                dt_cp = 0.001,
                                rf_trees = 200,
@@ -436,39 +436,33 @@ fit_selected_model <- function(data, model_type, target, predictors,
   }
   
   else if (model_type == "Polynomial Regression") {
-    
-    poly_features <- c(
-      "distance_sin_interaction",
-      "distance_cos_interaction",
-      "stop_lat",
-      "stop_lon"
-    )
-    
-    poly_features <- intersect(poly_features, predictors)
+
+    if (is.null(degrees)) {
+      degrees <- setNames(rep(2L, length(predictors)), predictors)
+    }
+
+    # Remap degree keys for freq-encoded columns
+    freq_cols <- c("route_short_name", "route_id", "trip_headsign", "stop_name", "stop_code")
+    names(degrees) <- ifelse(names(degrees) %in% freq_cols,
+                             paste0(names(degrees), "_freq"),
+                             names(degrees))
+
+    poly_features  <- intersect(names(degrees)[degrees > 1], predictors)
     linear_features <- setdiff(predictors, poly_features)
-    
-    linear_part <- paste(linear_features, collapse = " + ")
-    
-    poly_part <- paste0(
-      "poly(", poly_features, ", ", degree, ")",
-      collapse = " + "
+
+    terms_list <- c(
+      linear_features,
+      sapply(poly_features, function(f) paste0("poly(", f, ", ", degrees[[f]], ")"))
     )
-    
-    rhs <- paste(
-      c(linear_part, poly_part),
-      collapse = " + "
-    )
-    
-    formula_poly <- as.formula(
-      paste(target, "~", rhs)
-    )
-    
+
+    formula_poly <- as.formula(paste(target, "~", paste(terms_list, collapse = " + ")))
+
     model <- lm(formula_poly, data = train_data)
     model <- step(model, direction = "backward", trace = FALSE)
-    
+
     pred_train <- predict(model, newdata = train_data)
     pred_test <- predict(model, newdata = test_data)
-    
+
     selected_features <- attr(terms(model), "term.labels")
   }
   
